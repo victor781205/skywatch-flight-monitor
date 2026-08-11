@@ -127,10 +127,9 @@ Duplicate prevention is layered:
 4. Each external channel claims a fingerprint of the complete message.
 5. Successful external notifications participate in the configured cooldown.
 
-Routine scheduled reports use only the primary search response. For round trips,
-SkyWatch requests the top itinerary's return and booking details only after the
-target price is reached. It no longer performs one detail request per preferred
-airline during every scheduled run.
+Routine round-trip reports use one primary search plus one return-detail request
+for the top itinerary. Booking-provider details remain target-hit only. SkyWatch
+does not perform one detail request per preferred airline during scheduled runs.
 
 ## Flight-data providers and quota
 

@@ -105,7 +105,7 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(search_mock.call_args.kwargs["travel_class"], 3)
         self.assertEqual(add_price_mock.call_args.kwargs["travel_class"], 3)
 
-    def test_non_hit_scheduled_report_does_not_fetch_details(self):
+    def test_non_hit_manual_report_does_not_fetch_details(self):
         monitor = {
             "id": 1,
             "route_id": 7,
@@ -134,6 +134,44 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(result["hit"])
         return_details.assert_not_called()
         booking_details.assert_not_called()
+
+    def test_non_hit_fixed_schedule_fetches_return_but_not_booking(self):
+        monitor = {
+            "id": 1,
+            "route_id": 7,
+            "origin": "TPE",
+            "destination": "BKK",
+            "outbound_date": "2026-09-01",
+            "return_date": "2026-09-08",
+            "target_price": 15000,
+            "adults": 1,
+            "travel_class": 1,
+            "last_price": 17378.0,
+        }
+        return_value = {
+            "airline": "Test Air",
+            "flight_number": "TA2",
+            "departure_time": "2026-09-08 09:00",
+            "arrival_time": "2026-09-08 12:00",
+            "booking_token": "booking-token",
+        }
+        with (
+            patch("src.monitor.search_flights", return_value=self._round_trip_result()),
+            patch("src.monitor.get_return_flight_info", return_value=return_value) as return_details,
+            patch("src.monitor.get_booking_provider") as booking_details,
+            patch("src.monitor.get_label", side_effect=lambda code: code),
+            patch("src.monitor.db.update_monitor_check"),
+            patch("src.monitor.db.add_price_record"),
+            patch("src.monitor.db.claim_notification", return_value=True),
+            patch("src.monitor.send_all", return_value=[("Telegram", True, "ok")]) as send_mock,
+            patch("src.monitor.ALWAYS_NOTIFY", True),
+            patch("src.monitor.MONITOR_FETCH_DETAILS_ON_HIT", True),
+        ):
+            result = check_one_monitor(monitor, scheduled_report=True)
+        self.assertFalse(result["hit"])
+        return_details.assert_called_once()
+        booking_details.assert_not_called()
+        self.assertIn("回程：Test Air TA2", send_mock.call_args.args[0])
 
     def test_hit_fetches_only_top_flight_details(self):
         monitor = {

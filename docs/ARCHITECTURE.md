@@ -51,8 +51,8 @@ Failed channel deliveries release their payload claim so a later run can retry.
 
 1. Each routine scheduled monitor performs one primary fare search.
 2. Preferred-airline summaries reuse the primary response.
-3. Only a target-price hit may request the top itinerary's return and booking
-   details.
+3. Fixed round-trip reports request return details for the top itinerary;
+   booking-provider details remain target-hit only.
 4. Successful requests are counted by provider and operation. No route, date,
    passenger, credential, or response content is written to usage telemetry.
 5. A database claim permits one quota warning per provider, month, and threshold.

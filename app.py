@@ -1232,7 +1232,7 @@ def page_settings():
         st.html('<div class="section-label">連線狀態</div>')
         st.write(f"**SerpAPI：** {'已設定' if SERPAPI_API_KEY else '未設定'}")
         st.write(f"**Travelpayouts 趨勢：** {'已設定' if travelpayouts_ready() else '未設定（可選）'}")
-        st.write("**查詢策略：** 單次主查詢 → 達標後補查詳細資料")
+        st.write("**查詢策略：** 主查詢 → 固定報告補回程 → 達標後查開票平台")
         st.write("**通知管道：** " + "、".join(configured_channels()))
         st.markdown(
             f"""
@@ -1251,7 +1251,7 @@ def page_settings():
             目前策略：**{'每次查價均通知' if ALWAYS_NOTIFY else '僅達標或價格變動時通知'}**
             固定回報：**每日 00:00 / 12:00 必送**
             手動冷卻：**{NOTIFY_COOLDOWN_HOURS:g} 小時**
-            詳細補查：**{'僅達標時啟用' if MONITOR_FETCH_DETAILS_ON_HIT else '停用'}**
+            詳細補查：**{'固定報告補回程；達標後查開票平台' if MONITOR_FETCH_DETAILS_ON_HIT else '停用'}**
             """
         )
     with col2:

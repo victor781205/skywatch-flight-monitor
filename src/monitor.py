@@ -134,7 +134,7 @@ def check_one_monitor(
             top_provider_str = ""
             ret_info = top_flight.get("return_flight") if top_flight else None
             should_fetch_details = bool(
-                hit
+                (hit or scheduled_report)
                 and MONITOR_FETCH_DETAILS_ON_HIT
                 and result.get("provider") == "serpapi"
                 and return_date
@@ -159,7 +159,7 @@ def check_one_monitor(
                 r_arr = clean_time(ret_info.get("arrival_time", ""))
                 top_ret_str = f"   回程：{r_air} {r_num}{r_plane} {r_dep} - {r_arr}\n"
 
-                b_token = ret_info.get("booking_token") if should_fetch_details else None
+                b_token = ret_info.get("booking_token") if hit and should_fetch_details else None
                 if b_token:
                     booking_provider = get_booking_provider(
                         b_token,
@@ -238,7 +238,10 @@ def check_one_monitor(
             msg += "\n".join(pure_blocks) + "\n\n"
             source_name = "Google Flights / SerpAPI"
             if not hit:
-                msg += "額度節省模式：達標時才補查回程與開票平台。\n"
+                if scheduled_report and return_date:
+                    msg += "固定回報已補查最推薦回程；開票平台達標時才查。\n"
+                else:
+                    msg += "額度節省模式：固定排程或達標時才補查回程。\n"
             msg += f"資料來源：{source_name}。下單前請再次確認最終價格。"
 
             # Prevent two scheduler processes from delivering the same report at once.

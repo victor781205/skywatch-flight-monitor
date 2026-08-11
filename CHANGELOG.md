@@ -13,6 +13,8 @@ All notable changes to SkyWatch are documented here. The project follows
   explicit cached-data labelling and no influence on alerts.
 - Remove the six-hour notification cooldown. Fixed 00:00 and 12:00 reports use
   dedicated schedule-slot claims, while concurrent duplicate delivery remains blocked.
+- Restore return-flight details for the top itinerary in fixed round-trip reports;
+  booking-provider lookup remains target-hit only.
 
 ## [2.4.0] - 2026-08-11
 
