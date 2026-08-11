@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from src import database as db
@@ -71,6 +72,21 @@ class DatabaseTests(unittest.TestCase):
         with db.get_db() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM notifications").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0], 1)
+
+    def test_api_usage_counts_successful_quota_calls(self):
+        stamp = datetime(2026, 8, 11, 9, 0)
+        db.record_api_usage("serpapi", "flight_search", True, created_at=stamp)
+        db.record_api_usage("serpapi", "flight_search", False, created_at=stamp)
+        summary = db.get_api_usage_summary("serpapi", 250, now=stamp)
+        self.assertEqual(summary["used"], 1)
+        self.assertEqual(summary["attempted"], 2)
+        self.assertEqual(summary["remaining"], 249)
+
+    def test_api_quota_warning_is_claimed_once_per_period(self):
+        self.assertTrue(db.claim_api_quota_warning("serpapi", "2026-08", 80))
+        self.assertFalse(db.claim_api_quota_warning("serpapi", "2026-08", 80))
+        db.release_api_quota_warning("serpapi", "2026-08", 80)
+        self.assertTrue(db.claim_api_quota_warning("serpapi", "2026-08", 80))
 
 
 if __name__ == "__main__":

@@ -21,8 +21,20 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src import database as db
+from src.api_usage import estimate_monthly_primary_searches, quota_summaries
 from src.airports import get_label, options_for_select
-from src.config import ALWAYS_NOTIFY, APP_VERSION, NOTIFY_COOLDOWN_HOURS, SERPAPI_API_KEY
+from src.config import (
+    AMADEUS_CLIENT_ID,
+    AMADEUS_CLIENT_SECRET,
+    API_USAGE_WARNING_PERCENT,
+    ALWAYS_NOTIFY,
+    APP_VERSION,
+    FLIGHT_API_FALLBACK,
+    FLIGHT_API_PROVIDER,
+    MONITOR_FETCH_DETAILS_ON_HIT,
+    NOTIFY_COOLDOWN_HOURS,
+    SERPAPI_API_KEY,
+)
 from src.flight_api import FlightAPIError, format_flight_summary
 from src.monitor import check_all_monitors, check_one_monitor, search_and_save
 from src.notifier import configured_channels, send_all
@@ -48,6 +60,10 @@ except FileNotFoundError:
 def _safe(value: object) -> str:
     """Escape dynamic values before rendering custom HTML."""
     return html.escape(str(value or ""), quote=True)
+
+
+def flight_api_ready() -> bool:
+    return bool(SERPAPI_API_KEY or (AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET))
 
 
 def get_scheduler_health() -> dict:
@@ -174,7 +190,7 @@ def inject_cmd_bar(
             f'<span class="pill">冷卻 <strong>{cooldown_h:g}h</strong></span>'
             f"{extra_html}"
             f"</div>"
-            f'<div class="right">資料來源 Google Flights · 自動排程監控</div>'
+            f'<div class="right">多來源票價 API · 免費額度優先排程</div>'
             f"</div>"
         ))
 
@@ -341,11 +357,12 @@ def sidebar():
         )
         st.markdown("---")
         channels = configured_channels()
-        api_ok = bool(SERPAPI_API_KEY)
+        api_ok = flight_api_ready()
+        api_label = "SerpAPI 已連線" if SERPAPI_API_KEY else "Amadeus 已連線"
         api_row = (
-            '<div class="sb-status-row"><span class="status-dot dot-on"></span>SerpAPI 已連線</div>'
+            f'<div class="sb-status-row"><span class="status-dot dot-on"></span>{api_label}</div>'
             if api_ok
-            else '<div class="sb-status-row"><span class="status-dot dot-off"></span>缺少 API Key</div>'
+            else '<div class="sb-status-row"><span class="status-dot dot-off"></span>缺少票價 API</div>'
         )
         ch_rows = "".join(
             f'<div class="sb-status-row"><span class="status-dot dot-on"></span>{ch}</div>'
@@ -497,7 +514,7 @@ def page_dashboard():
     channels = configured_channels()
     notification_health = get_notification_health()
     inject_cmd_bar(
-        api_ok=bool(SERPAPI_API_KEY),
+        api_ok=flight_api_ready(),
         channels=channels,
         cooldown_h=NOTIFY_COOLDOWN_HOURS,
         extra=f"最近推播 {notification_health['label']}",
@@ -636,14 +653,14 @@ def page_search():
     inject_hero(
         "搜尋航班",
         "設定航線與行程條件，快速比較可用票價",
-        ["Google Flights", "價格比較", "目標價監控"],
+        ["多來源票價", "價格比較", "目標價監控"],
         kicker="FLIGHT SEARCH",
     )
     inject_cmd_bar(
-        api_ok=bool(SERPAPI_API_KEY),
+        api_ok=flight_api_ready(),
         channels=configured_channels(),
         cooldown_h=NOTIFY_COOLDOWN_HOURS,
-        extra="Google Flights",
+        extra="免費額度優先",
     )
 
     st.html('<div class="section-label">搜尋條件</div>')
@@ -714,7 +731,7 @@ def page_search():
         if origin == destination:
             st.error("出發地與目的地不可相同")
             return
-        with st.spinner("正在向 Google Flights 查詢即時價格…"):
+        with st.spinner("正在向票價資料來源查詢價格…"):
             try:
                 result = search_and_save(
                     origin=origin,
@@ -1018,7 +1035,7 @@ def page_monitors():
         kicker="MONITORING",
     )
     inject_cmd_bar(
-        api_ok=bool(SERPAPI_API_KEY),
+        api_ok=flight_api_ready(),
         channels=configured_channels(),
         cooldown_h=NOTIFY_COOLDOWN_HOURS,
         extra="LIVE CHECK",
@@ -1158,15 +1175,21 @@ def page_monitors():
 def page_settings():
     inject_hero(
         "通知與系統設定",
-        "檢查資料來源、通知策略與背景排程",
-        ["SerpAPI", "Telegram", "資料維護"],
+        "檢查資料來源、免費額度、通知策略與背景排程",
+        ["額度節省", "API 備援", "Telegram"],
         kicker="SYSTEM",
     )
 
+    active_monitors = db.list_monitors(active_only=True)
     col1, col2 = st.columns(2)
     with col1:
         st.html('<div class="section-label">連線狀態</div>')
         st.write(f"**SerpAPI：** {'已設定' if SERPAPI_API_KEY else '未設定'}")
+        st.write(
+            f"**Amadeus 備援：** "
+            f"{'已設定' if AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET else '未設定（可選）'}"
+        )
+        st.write(f"**提供者順序：** {FLIGHT_API_PROVIDER} → {FLIGHT_API_FALLBACK or '無'}")
         st.write("**通知管道：** " + "、".join(configured_channels()))
         st.markdown(
             f"""
@@ -1174,6 +1197,10 @@ def page_settings():
 
             ```env
             SERPAPI_API_KEY=...
+            FLIGHT_API_PROVIDER=serpapi
+            FLIGHT_API_FALLBACK=amadeus
+            AMADEUS_CLIENT_ID=...
+            AMADEUS_CLIENT_SECRET=...
             DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
             TELEGRAM_BOT_TOKEN=...
             TELEGRAM_CHAT_ID=...
@@ -1183,6 +1210,7 @@ def page_settings():
 
             目前策略：**{'每次查價均通知' if ALWAYS_NOTIFY else '僅達標或價格變動時通知'}**
             通知冷卻：**{NOTIFY_COOLDOWN_HOURS:g} 小時**
+            詳細補查：**{'僅達標時啟用' if MONITOR_FETCH_DETAILS_ON_HIT else '停用'}**
             """
         )
     with col2:
@@ -1195,9 +1223,35 @@ def page_settings():
                 else:
                     st.error(f"{ch} · 失敗 — {detail}")
 
+    st.html('<div class="section-label">API 免費額度</div>')
+    summaries = quota_summaries()
+    serp_summary = summaries[0]
+    estimated_monthly = estimate_monthly_primary_searches(len(active_monitors))
+    qc1, qc2, qc3, qc4 = st.columns(4)
+    qc1.metric(
+        "SerpAPI 本月",
+        f"{serp_summary['used']} / {serp_summary['limit'] or '—'}",
+        f"嘗試 {serp_summary['attempted']} 次",
+    )
+    qc2.metric(
+        "免費剩餘",
+        f"{serp_summary['remaining']} 次" if serp_summary["remaining"] is not None else "未設定",
+    )
+    qc3.metric("排程月預估", f"{estimated_monthly} 次", f"{len(active_monitors)} 個啟用監控")
+    usage_percent = serp_summary.get("percent") or 0.0
+    qc4.metric("額度狀態", "注意" if usage_percent >= API_USAGE_WARNING_PERCENT else "正常", f"{usage_percent:.0f}%")
+    if serp_summary["limit"]:
+        st.progress(min(1.0, usage_percent / 100.0), text=f"SerpAPI 免費額度已使用 {usage_percent:.1f}%")
+    if usage_percent >= API_USAGE_WARNING_PERCENT:
+        st.warning(
+            f"SerpAPI 已超過 {API_USAGE_WARNING_PERCENT:g}% 警戒線；系統每月只推播一次額度警告。"
+        )
+    elif estimated_monthly > (serp_summary["limit"] or 10**9):
+        st.info("目前排程的整月預估會超過免費額度；建議減少監控項目或改為每日一次。")
+    st.caption("統計只記錄成功請求與操作類型，不保存航線、日期、API key 或旅遊資料。")
+
     st.html('<div class="section-label">獨立背景排程</div>')
     scheduler_health = get_scheduler_health()
-    active_monitors = db.list_monitors(active_only=True)
     notification_health = get_notification_health()
     sc1, sc2, sc3, sc4 = st.columns(4)
     sc1.metric("排程健康", "正常" if scheduler_health["healthy"] else "待確認")
@@ -1333,7 +1387,7 @@ def page_help():
         st.markdown(
             """
             **Q: SerpAPI 免費額度多少？**
-            > 免費方案每月 100 次查詢。建議監控間隔 ≥ 60 分鐘，避免快速用完。
+            > 免費方案目前每月 250 次成功查詢。SkyWatch 會統計用量，達 80% 時只提醒一次。
 
             **Q: 為什麼查不到價格？**
             > 可能是日期太近或航線無直飛。試試放寬日期範圍或換難度較低的航線。
@@ -1347,14 +1401,15 @@ def page_help():
             > 不會！系統會自動停用出發日已過的監控。
 
             **Q: 可以同時監控多少條航線？**
-            > 無上限，但每條活躍監控都會消耗一次 API 查詢。建議控制在 10 條以內。
+            > 每日查兩次時，一個監控約 60 次／月；250 次免費額度建議最多 4 個啟用監控。
             """
         )
 
     with st.expander("使用注意事項"):
         st.markdown(
             """
-            - SerpAPI 有額度限制，建議監控間隔 ≥ 30 分鐘
+            - 平常排程每個監控只做一次主查詢，達標時才補查回程與開票平台
+            - SerpAPI 免費額度有限，建議固定每日 1～2 次，不要使用高頻間隔
             - 價格僅供參考，下單前請至航空公司或 OTA 再確認
             - 勿將 `.env` 上傳公開儲存庫
             - 介面採一致的淺色主題，確保長時間閱讀清楚舒適

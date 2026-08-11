@@ -8,6 +8,24 @@ All notable changes to SkyWatch are documented here. The project follows
 - Prepare public open-source governance and GitHub automation.
 - Replace machine-specific Windows launch paths with portable project-relative paths.
 
+## [2.4.0] - 2026-08-11
+
+### Added
+
+- Local monthly API usage telemetry with configurable quota limits and an 80%
+  one-time warning.
+- Scheduled monthly usage projection in the system settings UI.
+- Optional Amadeus Self-Service fallback provider.
+- Provider and quota behavior tests.
+
+### Changed
+
+- Routine scheduled monitoring now uses one primary fare search per monitor.
+- Return-itinerary and booking-provider lookups run only when the target price is
+  reached.
+- Preferred-airline summaries reuse the primary response instead of issuing
+  additional API calls.
+
 ## [0.2.3] - 2026-08-11
 
 ### Added

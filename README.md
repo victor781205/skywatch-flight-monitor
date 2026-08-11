@@ -21,6 +21,9 @@ SkyWatch 是可自行部署的本機航班票價監控工作台，提供繁體�
 - Persist quote history locally in SQLite.
 - Run monitoring at fixed Asia/Taipei times or a configurable interval.
 - Send scheduled reports and target-price alerts through Telegram or Discord.
+- Conserve free API quota by using one primary search per routine monitor run.
+- Optionally fall back from SerpAPI to Amadeus Self-Service when credentials are configured.
+- Track successful monthly API requests and warn once when usage reaches 80%.
 - Prevent duplicate alerts with process locks, atomic database claims, cooldowns,
   and per-channel exact-message fingerprints.
 - Inspect scheduler health, latest notification, and next run from the UI.
@@ -79,6 +82,18 @@ Edit `.env`:
 
 ```env
 SERPAPI_API_KEY=
+FLIGHT_API_PROVIDER=serpapi
+FLIGHT_API_FALLBACK=amadeus
+SERPAPI_MONTHLY_LIMIT=250
+API_USAGE_WARNING_PERCENT=80
+
+# Optional fallback
+AMADEUS_CLIENT_ID=
+AMADEUS_CLIENT_SECRET=
+AMADEUS_ENV=test
+AMADEUS_MONTHLY_LIMIT=0
+
+MONITOR_FETCH_DETAILS_ON_HIT=true
 DISCORD_WEBHOOK_URL=
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
@@ -119,6 +134,24 @@ Duplicate prevention is layered:
 3. SQLite atomically claims each notification window.
 4. Each external channel claims a fingerprint of the complete message.
 5. Successful external notifications participate in the configured cooldown.
+
+Routine scheduled reports use only the primary search response. For round trips,
+SkyWatch requests the top itinerary's return and booking details only after the
+target price is reached. It no longer performs one detail request per preferred
+airline during every scheduled run.
+
+## Flight-data providers and quota
+
+SerpAPI remains the default because its Google Flights response is practical for
+self-hosted monitoring. Set `SERPAPI_MONTHLY_LIMIT` to the limit shown on your
+plan. SkyWatch counts successful requests locally, projects scheduled monthly
+usage, and sends one warning per provider and month at
+`API_USAGE_WARNING_PERCENT`.
+
+Amadeus is an optional fallback. Its `test` environment contains limited cached
+data; set `AMADEUS_ENV=production` only after your Amadeus application has
+production access and you understand its billing controls. A provider key is
+never committed or included in usage telemetry.
 
 The UI process does not start a second scheduler. See
 [Architecture](docs/ARCHITECTURE.md) for the complete flow.

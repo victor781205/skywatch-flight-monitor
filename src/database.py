@@ -99,6 +99,23 @@ def init_db() -> None:
                 FOREIGN KEY(monitor_id) REFERENCES monitors(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS api_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                success INTEGER NOT NULL DEFAULT 1,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS api_quota_warnings (
+                provider TEXT NOT NULL,
+                period TEXT NOT NULL,
+                threshold INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (provider, period, threshold)
+            );
+
             CREATE TABLE IF NOT EXISTS schema_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -110,6 +127,8 @@ def init_db() -> None:
                 ON monitors(active);
             CREATE INDEX IF NOT EXISTS idx_notification_claims_created
                 ON notification_claims(created_at);
+            CREATE INDEX IF NOT EXISTS idx_api_usage_provider_created
+                ON api_usage(provider, created_at);
             """
         )
 
@@ -117,7 +136,7 @@ def init_db() -> None:
         _ensure_column(conn, "price_history", "travel_class", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(conn, "monitors", "travel_class", "INTEGER NOT NULL DEFAULT 1")
         conn.execute(
-            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '2') "
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '3') "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
         )
 
@@ -626,3 +645,86 @@ def deduplicate_exact_history() -> Dict[str, int]:
             )
             deleted[table] = cursor.rowcount
     return deleted
+
+
+def record_api_usage(
+    provider: str,
+    operation: str,
+    success: bool = True,
+    detail: str = "",
+    created_at: Optional[datetime] = None,
+) -> None:
+    """Record one billable flight-data request without storing credentials or query parameters."""
+    stamp = (created_at or datetime.now()).isoformat(timespec="seconds")
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO api_usage (provider, operation, success, detail, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (provider.lower(), operation, 1 if success else 0, detail[:160], stamp),
+        )
+
+
+def get_api_usage_summary(
+    provider: str,
+    monthly_limit: int = 0,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    current = now or datetime.now()
+    period = current.strftime("%Y-%m")
+    start = current.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if start.month == 12:
+        end = start.replace(year=start.year + 1, month=1)
+    else:
+        end = start.replace(month=start.month + 1)
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN success=1 THEN 1 ELSE 0 END) AS successful,
+                   SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS failed
+            FROM api_usage
+            WHERE provider=? AND created_at>=? AND created_at<?
+            """,
+            (provider.lower(), start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")),
+        ).fetchone()
+    attempted = int(row["total"] or 0)
+    used = int(row["successful"] or 0)
+    limit = max(0, int(monthly_limit))
+    return {
+        "provider": provider.lower(),
+        "period": period,
+        "used": used,
+        "attempted": attempted,
+        "successful": int(row["successful"] or 0),
+        "failed": int(row["failed"] or 0),
+        "limit": limit,
+        "remaining": max(0, limit - used) if limit else None,
+        "percent": (used / limit * 100.0) if limit else None,
+    }
+
+
+def claim_api_quota_warning(provider: str, period: str, threshold: int) -> bool:
+    """Allow one warning per provider, month, and configured threshold."""
+    with get_db() as conn:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO api_quota_warnings (provider, period, threshold, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (provider.lower(), period, int(threshold), datetime.now().isoformat(timespec="seconds")),
+        )
+        return cur.rowcount == 1
+
+
+def release_api_quota_warning(provider: str, period: str, threshold: int) -> None:
+    """Release a warning claim after every configured delivery channel fails."""
+    with get_db() as conn:
+        conn.execute(
+            """
+            DELETE FROM api_quota_warnings
+            WHERE provider=? AND period=? AND threshold=?
+            """,
+            (provider.lower(), period, int(threshold)),
+        )

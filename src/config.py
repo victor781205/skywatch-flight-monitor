@@ -7,9 +7,38 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY", "")
+FLIGHT_API_PROVIDER = os.getenv("FLIGHT_API_PROVIDER", "serpapi").strip().lower() or "serpapi"
+FLIGHT_API_FALLBACK = os.getenv("FLIGHT_API_FALLBACK", "amadeus").strip().lower()
+AMADEUS_CLIENT_ID = os.getenv("AMADEUS_CLIENT_ID", "")
+AMADEUS_CLIENT_SECRET = os.getenv("AMADEUS_CLIENT_SECRET", "")
+AMADEUS_ENV = os.getenv("AMADEUS_ENV", "test").strip().lower()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+
+def _positive_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _bounded_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        return min(maximum, max(minimum, float(os.getenv(name, str(default)))))
+    except ValueError:
+        return default
+
+
+SERPAPI_MONTHLY_LIMIT = _positive_int("SERPAPI_MONTHLY_LIMIT", 250)
+AMADEUS_MONTHLY_LIMIT = _positive_int("AMADEUS_MONTHLY_LIMIT", 0)
+API_USAGE_WARNING_PERCENT = _bounded_float("API_USAGE_WARNING_PERCENT", 80.0, 1.0, 100.0)
+MONITOR_FETCH_DETAILS_ON_HIT = os.getenv("MONITOR_FETCH_DETAILS_ON_HIT", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 
 # 預設每次排程回報一次；跨程序鎖、通知 claim 與冷卻時間負責防止重複推播。
 ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "true").lower() in ("true", "1", "yes")
@@ -26,7 +55,7 @@ try:
 except ValueError:
     MESSAGE_DEDUPE_HOURS = 24.0
 
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 
 DB_PATH = BASE_DIR / "data" / "flights.db"
 DATA_DIR = BASE_DIR / "data"

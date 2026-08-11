@@ -6,9 +6,17 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from . import database as db
+from .api_usage import maybe_send_quota_warnings
 from .airports import get_label
-from .config import ALWAYS_NOTIFY, NOTIFY_COOLDOWN_HOURS
-from .flight_api import FlightAPIError, get_return_flight_info, get_booking_provider, format_flight_summary, search_flights, dump_result_json
+from .config import ALWAYS_NOTIFY, MONITOR_FETCH_DETAILS_ON_HIT, NOTIFY_COOLDOWN_HOURS
+from .flight_api import (
+    FlightAPIError,
+    dump_result_json,
+    format_flight_summary,
+    get_booking_provider,
+    get_return_flight_info,
+    search_flights,
+)
 from .notifier import DUPLICATE_SUPPRESSED, send_all
 
 
@@ -120,21 +128,46 @@ def check_one_monitor(monitor: Dict[str, Any], save_history: bool = True) -> Dic
 
             top_ret_str = ""
             top_provider_str = ""
-            if return_date and top_flight and top_flight.get("departure_token"):
-                ret_info = get_return_flight_info(top_flight["departure_token"], origin, destination, outbound_date, return_date, adults=adults, travel_class=travel_class)
-                if ret_info:
-                    r_air = ret_info.get("airline", "")
-                    r_num = ret_info.get("flight_number", "")
-                    r_plane = f" ({ret_info.get('airplane')})" if ret_info.get("airplane") else ""
-                    r_dep = clean_time(ret_info.get("departure_time", ""))
-                    r_arr = clean_time(ret_info.get("arrival_time", ""))
-                    top_ret_str = f"   回程：{r_air} {r_num}{r_plane} {r_dep} - {r_arr}\n"
+            ret_info = top_flight.get("return_flight") if top_flight else None
+            should_fetch_details = bool(
+                hit
+                and MONITOR_FETCH_DETAILS_ON_HIT
+                and result.get("provider") == "serpapi"
+                and return_date
+                and top_flight
+                and top_flight.get("departure_token")
+            )
+            if should_fetch_details:
+                ret_info = get_return_flight_info(
+                    top_flight["departure_token"],
+                    origin,
+                    destination,
+                    outbound_date,
+                    return_date,
+                    adults=adults,
+                    travel_class=travel_class,
+                )
+            if ret_info:
+                r_air = ret_info.get("airline", "")
+                r_num = ret_info.get("flight_number", "")
+                r_plane = f" ({ret_info.get('airplane')})" if ret_info.get("airplane") else ""
+                r_dep = clean_time(ret_info.get("departure_time", ""))
+                r_arr = clean_time(ret_info.get("arrival_time", ""))
+                top_ret_str = f"   回程：{r_air} {r_num}{r_plane} {r_dep} - {r_arr}\n"
 
-                    b_token = ret_info.get("booking_token")
-                    if b_token:
-                        provider = get_booking_provider(b_token, origin, destination, outbound_date, return_date, adults=adults, travel_class=travel_class)
-                        if provider:
-                            top_provider_str = f"   🎫 開票渠道：{provider}\n"
+                b_token = ret_info.get("booking_token") if should_fetch_details else None
+                if b_token:
+                    booking_provider = get_booking_provider(
+                        b_token,
+                        origin,
+                        destination,
+                        outbound_date,
+                        return_date,
+                        adults=adults,
+                        travel_class=travel_class,
+                    )
+                    if booking_provider:
+                        top_provider_str = f"   🎫 開票渠道：{booking_provider}\n"
 
             top_msg = (
                 f"🌟 【最推薦組合】\n"
@@ -144,7 +177,7 @@ def check_one_monitor(monitor: Dict[str, Any], save_history: bool = True) -> Dic
                 f"{top_provider_str}"
             )
 
-            # 2~4. 三大國籍航空組合
+            # 2~4. 三大國籍航空直接使用主搜尋結果，避免排程逐家補查。
             premium_airlines = [
                 {"name": "長榮航空", "keywords": ["長榮", "EVA"]},
                 {"name": "中華航空", "keywords": ["中華", "華航", "China Airlines"]},
@@ -156,62 +189,34 @@ def check_one_monitor(monitor: Dict[str, Any], save_history: bool = True) -> Dic
                 for pa in premium_airlines:
                     name = pa["name"]
                     keywords = pa["keywords"]
-                    found = False
-
-                    for f in result["flights"]:
-                        f_air = f.get("airline", "")
-                        if any(k.lower() in f_air.lower() for k in keywords):
-                            if return_date and f.get("departure_token"):
-                                ret_info = get_return_flight_info(
-                                    f["departure_token"], origin, destination, outbound_date, return_date, keywords=keywords, adults=adults, travel_class=travel_class
-                                )
-                                if ret_info and any(k.lower() in ret_info.get("airline", "").lower() for k in keywords):
-                                    found = True
-                                    p_total = ret_info.get("price") or f.get("price")
-                                    p_person_str = f"(單人 TWD {p_total // adults:,.0f})" if adults > 1 else ""
-
-                                    f_num = f.get("flight_number", "")
-                                    f_plane = f" ({f.get('airplane')})" if f.get("airplane") else ""
-                                    dep_t = clean_time(f.get("departure_time", ""))
-                                    arr_t = clean_time(f.get("arrival_time", ""))
-
-                                    r_num = ret_info.get("flight_number", "")
-                                    r_plane = f" ({ret_info.get('airplane')})" if ret_info.get("airplane") else ""
-                                    r_dep = clean_time(ret_info.get("departure_time", ""))
-                                    r_arr = clean_time(ret_info.get("arrival_time", ""))
-
-                                    provider_str = ""
-                                    b_token = ret_info.get("booking_token")
-                                    if b_token:
-                                        provider = get_booking_provider(b_token, origin, destination, outbound_date, return_date, adults=adults, travel_class=travel_class)
-                                        if provider:
-                                            provider_str = f"   🎫 開票渠道：{provider}\n"
-
-                                    block = (
-                                        f"✈️ {name}\n"
-                                        f"總價：TWD {p_total:,.0f} {p_person_str}\n"
-                                        f"   去程：{f_num}{f_plane} {dep_t} - {arr_t}\n"
-                                        f"   回程：{r_num}{r_plane} {r_dep} - {r_arr}\n"
-                                        f"{provider_str}"
-                                    )
-                                    pure_blocks.append(block)
-                                    break
-                            elif not return_date:
-                                found = True
-                                p_total = f.get("price")
-                                p_person_str = f"(單人 TWD {p_total // adults:,.0f})" if adults > 1 else ""
-                                f_num = f.get("flight_number", "")
-                                f_plane = f" ({f.get('airplane')})" if f.get("airplane") else ""
-                                dep_t = clean_time(f.get("departure_time", ""))
-                                arr_t = clean_time(f.get("arrival_time", ""))
-                                block = (
-                                    f"✈️ {name}\n"
-                                    f"總價：TWD {p_total:,.0f} {p_person_str}\n"
-                                    f"   去程：{f_num}{f_plane} {dep_t} - {arr_t}\n"
-                                )
-                                pure_blocks.append(block)
-                                break
-                    if not found:
+                    matched = next(
+                        (
+                            flight
+                            for flight in result["flights"]
+                            if any(k.lower() in flight.get("airline", "").lower() for k in keywords)
+                        ),
+                        None,
+                    )
+                    if matched:
+                        p_total = matched.get("price")
+                        p_person_str = f"(單人 TWD {p_total // adults:,.0f})" if adults > 1 else ""
+                        f_num = matched.get("flight_number", "")
+                        f_plane = f" ({matched.get('airplane')})" if matched.get("airplane") else ""
+                        dep_t = clean_time(matched.get("departure_time", ""))
+                        arr_t = clean_time(matched.get("arrival_time", ""))
+                        block = (
+                            f"✈️ {name}\n"
+                            f"總價：TWD {p_total:,.0f} {p_person_str}\n"
+                            f"   去程：{f_num}{f_plane} {dep_t} - {arr_t}\n"
+                        )
+                        matched_return = matched.get("return_flight")
+                        if matched_return:
+                            r_num = matched_return.get("flight_number", "")
+                            r_dep = clean_time(matched_return.get("departure_time", ""))
+                            r_arr = clean_time(matched_return.get("arrival_time", ""))
+                            block += f"   回程：{r_num} {r_dep} - {r_arr}\n"
+                        pure_blocks.append(block)
+                    else:
                         pure_blocks.append(f"✈️ {name}：未找到同航空公司來回組合\n")
 
             msg = (
@@ -226,7 +231,10 @@ def check_one_monitor(monitor: Dict[str, Any], save_history: bool = True) -> Dic
             msg += f"{top_msg}\n"
             msg += f"🏆 【三大國籍航空】\n\n"
             msg += "\n".join(pure_blocks) + "\n\n"
-            msg += "請盡快到 Google Flights 確認訂購！"
+            source_name = "Google Flights / SerpAPI" if result.get("provider") == "serpapi" else "Amadeus"
+            if not hit:
+                msg += "額度節省模式：達標時才補查回程與開票平台。\n"
+            msg += f"資料來源：{source_name}。下單前請再次確認最終價格。"
 
             # Prevent two scheduler processes from delivering the same report at once.
             window_seconds = max(300, int(NOTIFY_COOLDOWN_HOURS * 3600))
@@ -271,7 +279,9 @@ def check_one_monitor(monitor: Dict[str, Any], save_history: bool = True) -> Dic
 def check_all_monitors() -> List[Dict[str, Any]]:
     db.expire_monitors()  # 自動停用已過出發日的監控，節省 API 額度
     monitors = db.list_monitors(active_only=True)
-    return [check_one_monitor(m) for m in monitors]
+    results = [check_one_monitor(m) for m in monitors]
+    maybe_send_quota_warnings(send_all)
+    return results
 
 
 def search_and_save(

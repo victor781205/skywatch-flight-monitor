@@ -1,4 +1,4 @@
-"""SerpAPI Google Flights 查詢模組"""
+"""Flight search provider orchestration with quota-aware usage tracking."""
 from __future__ import annotations
 
 import json
@@ -7,11 +7,21 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from .config import SERPAPI_API_KEY
+from . import amadeus
+from . import database as db
+from .config import FLIGHT_API_FALLBACK, FLIGHT_API_PROVIDER, SERPAPI_API_KEY
 
 
 class FlightAPIError(Exception):
     pass
+
+
+def _record_usage(provider: str, operation: str, success: bool, detail: str = "") -> None:
+    try:
+        db.record_api_usage(provider, operation, success=success, detail=detail)
+    except Exception:
+        # Usage telemetry must never break fare searches.
+        pass
 
 
 def _validate_search(
@@ -53,18 +63,95 @@ def search_flights(
     gl: str = "tw",
     max_results: int = 10,
 ) -> Dict[str, Any]:
+    """Search the configured primary provider and use an available fallback on failure."""
+    origin = origin.upper().strip()
+    destination = destination.upper().strip()
+    _validate_search(origin, destination, outbound_date, return_date, adults, travel_class)
+
+    order: List[str] = []
+    for provider in (FLIGHT_API_PROVIDER, FLIGHT_API_FALLBACK):
+        normalized = provider.strip().lower()
+        if normalized and normalized not in order:
+            order.append(normalized)
+
+    errors: List[str] = []
+    attempted = False
+    empty_result: Optional[Dict[str, Any]] = None
+    for provider in order:
+        if provider == "serpapi":
+            if not SERPAPI_API_KEY:
+                errors.append("SerpAPI：未設定 API key")
+                continue
+            attempted = True
+            try:
+                result = _search_serpapi(
+                    origin,
+                    destination,
+                    outbound_date,
+                    return_date,
+                    adults,
+                    travel_class,
+                    currency,
+                    hl,
+                    gl,
+                    max_results,
+                )
+                if result.get("flights"):
+                    return result
+                empty_result = result
+                errors.append("SerpAPI：查無符合條件的票價")
+            except FlightAPIError as exc:
+                errors.append(f"SerpAPI：{exc}")
+        elif provider == "amadeus":
+            if not amadeus.configured():
+                errors.append("Amadeus：未設定憑證")
+                continue
+            attempted = True
+            try:
+                result = amadeus.search_flights(
+                    origin,
+                    destination,
+                    outbound_date,
+                    return_date,
+                    adults,
+                    travel_class,
+                    currency,
+                    max_results,
+                )
+                _record_usage("amadeus", "flight_search", True)
+                if result.get("flights"):
+                    return result
+                empty_result = empty_result or result
+                errors.append("Amadeus：查無符合條件的票價")
+            except amadeus.AmadeusError as exc:
+                _record_usage("amadeus", "flight_search", False, str(exc))
+                errors.append(f"Amadeus：{exc}")
+
+    if not attempted:
+        raise FlightAPIError("沒有可用的票價 API；請設定 SerpAPI 或 Amadeus 憑證")
+    if empty_result is not None:
+        empty_result["provider_errors"] = errors
+        return empty_result
+    raise FlightAPIError("；".join(errors) or "所有票價 API 都查詢失敗")
+
+
+def _search_serpapi(
+    origin: str,
+    destination: str,
+    outbound_date: str,
+    return_date: Optional[str] = None,
+    adults: int = 1,
+    travel_class: int = 1,
+    currency: str = "TWD",
+    hl: str = "zh-tw",
+    gl: str = "tw",
+    max_results: int = 10,
+) -> Dict[str, Any]:
     """
     查詢 Google Flights（經 SerpAPI）。
     outbound_date / return_date 格式: YYYY-MM-DD
     travel_class: 1=經濟, 2=豪經, 3=商務, 4=頭等
     """
-    if not SERPAPI_API_KEY:
-        raise FlightAPIError("未設定 SERPAPI_API_KEY，請在 .env 填入金鑰")
-
-    origin = origin.upper().strip()
-    destination = destination.upper().strip()
-    _validate_search(origin, destination, outbound_date, return_date, adults, travel_class)
-
     params: Dict[str, Any] = {
         "engine": "google_flights",
         "departure_id": origin,
@@ -86,17 +173,24 @@ def search_flights(
         resp.raise_for_status()
         data = resp.json()
     except requests.Timeout as exc:
+        _record_usage("serpapi", "flight_search", False, "timeout")
         raise FlightAPIError("SerpAPI 回應逾時，請稍後再試") from exc
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else "未知"
+        _record_usage("serpapi", "flight_search", False, f"http_{status}")
         raise FlightAPIError(f"SerpAPI 回應失敗（HTTP {status}）") from exc
     except requests.RequestException as exc:
+        _record_usage("serpapi", "flight_search", False, "connection")
         raise FlightAPIError("SerpAPI 連線失敗，請檢查網路後再試") from exc
     except ValueError as exc:
+        _record_usage("serpapi", "flight_search", False, "invalid_json")
         raise FlightAPIError("SerpAPI 回傳了無法解析的資料") from exc
 
     if "error" in data:
+        _record_usage("serpapi", "flight_search", False, str(data["error"]))
         raise FlightAPIError(str(data["error"]))
+
+    _record_usage("serpapi", "flight_search", True)
 
     flights = _parse_flights(data, max_results=max_results)
     best_price = flights[0]["price"] if flights else None
@@ -110,6 +204,7 @@ def search_flights(
         "best_price": best_price,
         "flights": flights,
         "raw": data,
+        "provider": "serpapi",
     }
 
 
@@ -151,6 +246,10 @@ def get_return_flight_info(
         )
         resp.raise_for_status()
         data = resp.json()
+        if "error" in data:
+            _record_usage("serpapi", "return_details", False, str(data["error"]))
+            return None
+        _record_usage("serpapi", "return_details", True)
         flights = _parse_flights(data, max_results=30)
         if flights:
             if keywords:
@@ -164,8 +263,8 @@ def get_return_flight_info(
                     if target_airline.lower() in f_air or f_air in target_airline.lower():
                         return f
             return flights[0]
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_usage("serpapi", "return_details", False, type(exc).__name__)
     return None
 
 
@@ -285,6 +384,10 @@ def get_booking_provider(
         resp = requests.get("https://serpapi.com/search", params=params, timeout=60)
         resp.raise_for_status()
         data = resp.json()
+        if "error" in data:
+            _record_usage("serpapi", "booking_options", False, str(data["error"]))
+            return None
+        _record_usage("serpapi", "booking_options", True)
         opts = data.get("booking_options") or []
         if opts:
             first_opt = opts[0]
@@ -296,8 +399,8 @@ def get_booking_provider(
                 return f"{dep_provider} / {ret_provider}"
             elif first_opt.get("departing"):
                 return first_opt["departing"].get("book_with")
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_usage("serpapi", "booking_options", False, type(exc).__name__)
     return None
 
 

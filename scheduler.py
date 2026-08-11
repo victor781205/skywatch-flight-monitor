@@ -54,7 +54,14 @@ def _write_status(**updates) -> None:
 def log_message(msg: str):
     timestamp = _now().strftime("%Y-%m-%d %H:%M:%S")
     full_msg = f"[{timestamp}] {msg}"
-    print(full_msg, flush=True)
+    try:
+        print(full_msg, flush=True)
+    except UnicodeEncodeError:
+        # Traditional Windows consoles commonly use CP950 and cannot encode
+        # every status symbol. Console rendering must never abort a monitor job.
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        safe_message = full_msg.encode(encoding, errors="replace").decode(encoding)
+        print(safe_message, flush=True)
     log_file = ROOT / "data" / "scheduler.log"
     try:
         log_file.parent.mkdir(parents=True, exist_ok=True)
