@@ -10,6 +10,7 @@ flowchart LR
   S[APScheduler service] --> M[Monitor engine]
   M --> API
   API --> EXT[SerpAPI / Google Flights data]
+  UI --> TP[Travelpayouts cached market context]
   UI --> DB[(SQLite)]
   M --> DB
   M --> N[Notification dispatcher]
@@ -25,6 +26,7 @@ flowchart LR
 - `scheduler.py`: production APScheduler service, timezone, process lock, and
   heartbeat persistence.
 - `src/flight_api.py`: validation, SerpAPI adapter, and operation telemetry.
+- `src/travelpayouts.py`: cached Data API market reference for manual searches.
 - `src/api_usage.py`: monthly quota summaries, projections, and warning policy.
 - `src/monitor.py`: quote persistence, alert policy, message construction, and
   scheduler-window deduplication.
@@ -54,6 +56,10 @@ Failed channel deliveries release their payload claim so a later run can retry.
 4. Successful requests are counted by provider and operation. No route, date,
    passenger, credential, or response content is written to usage telemetry.
 5. A database claim permits one quota warning per provider, month, and threshold.
+
+Travelpayouts is deliberately outside the alert path. It runs only with a
+user-initiated UI search, is labelled as cached, and cannot cause a target-price
+hit or Telegram notification.
 
 ## Data and trust boundaries
 

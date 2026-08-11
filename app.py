@@ -34,6 +34,11 @@ from src.config import (
 from src.flight_api import FlightAPIError, format_flight_summary
 from src.monitor import check_all_monitors, check_one_monitor, search_and_save
 from src.notifier import configured_channels, send_all
+from src.travelpayouts import (
+    TravelpayoutsError,
+    configured as travelpayouts_ready,
+    get_market_reference,
+)
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
@@ -739,6 +744,25 @@ def page_search():
                 )
                 st.session_state["last_result"] = result
                 st.session_state["last_adults"] = int(adults)
+                st.session_state["last_market_reference"] = None
+                if travelpayouts_ready() and int(adults) == 1 and travel_class == 1:
+                    try:
+                        st.session_state["last_market_reference"] = get_market_reference(
+                            origin=origin,
+                            destination=destination,
+                            outbound_date=outbound.isoformat(),
+                            return_date=return_d.isoformat() if return_d else None,
+                        )
+                    except TravelpayoutsError as market_error:
+                        st.session_state["last_market_reference"] = {
+                            "available": False,
+                            "error": str(market_error),
+                        }
+                elif travelpayouts_ready():
+                    st.session_state["last_market_reference"] = {
+                        "available": False,
+                        "unsupported_fare_basis": True,
+                    }
             except FlightAPIError as e:
                 st.error(f"查詢失敗：{e}")
                 return
@@ -795,6 +819,34 @@ def page_search():
             f'</div>'
         )
         render_price_insight(insight, best)
+        market_reference = st.session_state.get("last_market_reference")
+        st.html('<div class="section-label">市場趨勢參考</div>')
+        if not travelpayouts_ready():
+            st.caption("Travelpayouts Data API 未設定；目前僅顯示 SerpAPI 即時報價。")
+        elif market_reference and market_reference.get("error"):
+            st.warning(f"趨勢資料暫時無法取得：{market_reference['error']}")
+        elif market_reference and market_reference.get("unsupported_fare_basis"):
+            st.caption("為避免錯誤比價，快取趨勢只顯示於 1 位成人、經濟艙的搜尋。")
+        elif not market_reference or not market_reference.get("available"):
+            st.caption("Travelpayouts 快取中沒有這條航線／月份的可用觀察值。")
+        else:
+            reference_price = float(market_reference["price"])
+            reference_label = (
+                "同日快取觀察價"
+                if market_reference.get("match") == "exact_date"
+                else "本月快取低價"
+            )
+            price_gap = float(best) - reference_price if best is not None else None
+            market_col1, market_col2 = st.columns(2)
+            market_col1.metric(reference_label, f"NT$ {reference_price:,.0f}")
+            market_col2.metric(
+                "即時價相對差額",
+                f"NT$ {price_gap:+,.0f}" if price_gap is not None else "—",
+            )
+            st.caption(
+                f"觀察日期 {market_reference['departure_date']} · "
+                f"樣本 {market_reference['observations']} 筆 · 快取資料，不能視為目前可購買價格"
+            )
         st.html(
             (
                 f'<div class="stat-grid">'
@@ -1181,6 +1233,7 @@ def page_settings():
     with col1:
         st.html('<div class="section-label">連線狀態</div>')
         st.write(f"**SerpAPI：** {'已設定' if SERPAPI_API_KEY else '未設定'}")
+        st.write(f"**Travelpayouts 趨勢：** {'已設定' if travelpayouts_ready() else '未設定（可選）'}")
         st.write("**查詢策略：** 單次主查詢 → 達標後補查詳細資料")
         st.write("**通知管道：** " + "、".join(configured_channels()))
         st.markdown(
@@ -1189,6 +1242,7 @@ def page_settings():
 
             ```env
             SERPAPI_API_KEY=...
+            TRAVELPAYOUTS_TOKEN=...
             DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
             TELEGRAM_BOT_TOKEN=...
             TELEGRAM_CHAT_ID=...

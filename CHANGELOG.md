@@ -9,6 +9,8 @@ All notable changes to SkyWatch are documented here. The project follows
 - Replace machine-specific Windows launch paths with portable project-relative paths.
 - Remove the Amadeus fallback from runtime and settings because it is not an
   available credential path for this project's owner.
+- Add optional Travelpayouts Data API market context to manual searches, with
+  explicit cached-data labelling and no influence on alerts.
 
 ## [2.4.0] - 2026-08-11
 

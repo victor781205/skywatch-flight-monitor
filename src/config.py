@@ -7,6 +7,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY", "")
+TRAVELPAYOUTS_TOKEN = os.getenv("TRAVELPAYOUTS_TOKEN", "")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -49,7 +50,7 @@ try:
 except ValueError:
     MESSAGE_DEDUPE_HOURS = 24.0
 
-APP_VERSION = "2.4.1"
+APP_VERSION = "2.5.0"
 
 DB_PATH = BASE_DIR / "data" / "flights.db"
 DATA_DIR = BASE_DIR / "data"

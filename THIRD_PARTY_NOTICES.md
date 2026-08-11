@@ -11,9 +11,10 @@ control and can be regenerated with `python scripts/download_airports.py`.
 
 ## External services
 
-SkyWatch can interact with SerpAPI, Google Flights links, Telegram, and Discord.
+SkyWatch can interact with SerpAPI, the Travelpayouts Data API, Google Flights
+links, Telegram, and Discord.
 Those services are not included in the MIT license for SkyWatch and are subject
 to their own terms, quotas, availability, branding, and privacy policies.
 
 SkyWatch is an independent project and is not affiliated with or endorsed by
-OpenAI, Google, SerpAPI, Telegram, Discord, or any airline.
+OpenAI, Google, SerpAPI, Travelpayouts, Telegram, Discord, or any airline.

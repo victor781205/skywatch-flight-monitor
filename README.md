@@ -81,6 +81,7 @@ Edit `.env`:
 
 ```env
 SERPAPI_API_KEY=
+TRAVELPAYOUTS_TOKEN=
 SERPAPI_MONTHLY_LIMIT=250
 API_USAGE_WARNING_PERCENT=80
 
@@ -142,6 +143,14 @@ usage, and sends one warning per provider and month at
 Provider keys are never committed or included in usage telemetry. Additional
 fare providers should only be enabled after confirming that the project owner
 can obtain and legally use production credentials.
+
+Travelpayouts is integrated only through its cached Data API. During a manual
+search, SkyWatch can show an exact-date cached observation or the lowest cached
+observation in the departure month beside the current SerpAPI result. This
+market context never triggers a monitor alert and is always labelled as cached,
+because it may not represent a currently bookable fare. The restricted
+Travelpayouts real-time Search API is not used. Numeric comparison is limited to
+one-adult economy searches so unlike fare bases are not presented as equivalent.
 
 The UI process does not start a second scheduler. See
 [Architecture](docs/ARCHITECTURE.md) for the complete flow.
