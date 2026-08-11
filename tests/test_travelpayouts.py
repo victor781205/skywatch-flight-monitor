@@ -33,6 +33,7 @@ class TravelpayoutsTests(unittest.TestCase):
             "data": {
                 "2026-09-02": {"price": 11000},
                 "2026-09-03": {"price": 9000},
+                "2026-10-01": {"price": 1000},
             },
         }
         get_mock.return_value = response

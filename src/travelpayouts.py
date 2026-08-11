@@ -91,6 +91,8 @@ def get_market_reference(
             observed = date.fromisoformat(observed_date)
         except (KeyError, TypeError, ValueError):
             continue
+        if (observed.year, observed.month) != (outbound.year, outbound.month):
+            continue
         if price <= 0:
             continue
         candidates.append((observed, price, item))
