@@ -1,0 +1,35 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Runtime data
+data/*.db
+data/*.db-*
+data/*.log
+data/*.log.*
+data/*.lock
+data/scheduler_status.json
+data/airports_iata.csv
+data/airports_iata.json
+legacy/
+
+# Local design and submission working files
+skywatch-operations.html
+DESIGN.md
+docs/CODEX_FOR_OSS_APPLICATION.md
+
+# Local exports and OS files
+*.csv~
+*.tmp
+$null
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
