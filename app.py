@@ -188,7 +188,7 @@ def inject_cmd_bar(
             f'<div class="left">'
             f'<span class="pill">API <strong>{api_txt}</strong></span>'
             f'<span class="pill">通知 <strong>{ch_txt}</strong></span>'
-            f'<span class="pill">冷卻 <strong>{cooldown_h:g}h</strong></span>'
+            f'<span class="pill">排程 <strong>必送</strong></span>'
             f"{extra_html}"
             f"</div>"
             f'<div class="right">多來源票價 API · 免費額度優先排程</div>'
@@ -377,7 +377,7 @@ def sidebar():
                 f"{ch_rows}"
                 f"</div>"
             ))
-        st.caption(f"通知冷卻 · {NOTIFY_COOLDOWN_HOURS:g}h")
+        st.caption("固定回報 · 每日 00:00 / 12:00")
         st.caption(f"全球機場 · 約 8,800 個 IATA")
         st.markdown("---")
         st.caption(f"SkyWatch v{APP_VERSION} · {datetime.now().strftime('%Y-%m-%d')}")
@@ -1150,9 +1150,7 @@ def page_monitors():
                             st.info("查無價格")
                         if r.get("hit"):
                             if r.get("skipped_notify"):
-                                st.info(
-                                    f"已達目標價，但 {NOTIFY_COOLDOWN_HOURS:g} 小時內已通知過（去重略過）"
-                                )
+                                st.info("已達目標價；同一瞬間的重複通知已略過")
                             elif r.get("notified"):
                                 st.warning("已達目標價，已發送通知")
                             else:
@@ -1251,7 +1249,8 @@ def page_settings():
             ```
 
             目前策略：**{'每次查價均通知' if ALWAYS_NOTIFY else '僅達標或價格變動時通知'}**
-            通知冷卻：**{NOTIFY_COOLDOWN_HOURS:g} 小時**
+            固定回報：**每日 00:00 / 12:00 必送**
+            手動冷卻：**{NOTIFY_COOLDOWN_HOURS:g} 小時**
             詳細補查：**{'僅達標時啟用' if MONITOR_FETCH_DETAILS_ON_HIT else '停用'}**
             """
         )

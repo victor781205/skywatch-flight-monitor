@@ -35,14 +35,14 @@ MONITOR_FETCH_DETAILS_ON_HIT = os.getenv("MONITOR_FETCH_DETAILS_ON_HIT", "true")
     "yes",
 )
 
-# 預設每次排程回報一次；跨程序鎖、通知 claim 與冷卻時間負責防止重複推播。
+# 預設每次排程回報一次；跨程序鎖與通知 claim 負責防止重複推播。
 ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "true").lower() in ("true", "1", "yes")
 
-# 同一監控在 N 小時內不重複推播。ALWAYS_NOTIFY 開啟時仍保留最短冷卻時間。
+# 可選的手動檢查冷卻時間；固定排程不受此設定影響。
 try:
-    NOTIFY_COOLDOWN_HOURS = max(0.0, float(os.getenv("NOTIFY_COOLDOWN_HOURS", "6")))
+    NOTIFY_COOLDOWN_HOURS = max(0.0, float(os.getenv("NOTIFY_COOLDOWN_HOURS", "0")))
 except ValueError:
-    NOTIFY_COOLDOWN_HOURS = 6.0
+    NOTIFY_COOLDOWN_HOURS = 0.0
 
 # 完全相同的報價內容即使被不同程序同時觸發，也只允許每個管道送出一次。
 try:

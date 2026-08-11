@@ -27,7 +27,7 @@ class MonitorTests(unittest.TestCase):
 
     @patch("src.monitor.send_all", return_value=[("Telegram", True, "ok")])
     @patch("src.monitor.db.claim_notification", return_value=True)
-    @patch("src.monitor.db.recent_success_notification", return_value=None)
+    @patch("src.monitor.db.recent_success_notification", return_value={"id": 99})
     @patch("src.monitor.db.add_price_record")
     @patch("src.monitor.db.update_monitor_check")
     @patch("src.monitor.get_label", side_effect=lambda code: code)
@@ -70,11 +70,13 @@ class MonitorTests(unittest.TestCase):
         }
 
         with patch("src.monitor.ALWAYS_NOTIFY", True):
-            result = check_one_monitor(monitor)
+            result = check_one_monitor(monitor, scheduled_report=True)
 
         self.assertTrue(result["notified"])
         self.assertEqual(result["notify_reason"], "sent")
         send_mock.assert_called_once()
+        _recent_mock.assert_not_called()
+        self.assertIn("排程回報：", send_mock.call_args.args[0])
 
     @patch("src.monitor.db.add_price_record")
     @patch("src.monitor.db.upsert_route", return_value=7)

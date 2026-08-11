@@ -11,6 +11,8 @@ All notable changes to SkyWatch are documented here. The project follows
   available credential path for this project's owner.
 - Add optional Travelpayouts Data API market context to manual searches, with
   explicit cached-data labelling and no influence on alerts.
+- Remove the six-hour notification cooldown. Fixed 00:00 and 12:00 reports use
+  dedicated schedule-slot claims, while concurrent duplicate delivery remains blocked.
 
 ## [2.4.0] - 2026-08-11
 

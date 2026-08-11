@@ -28,7 +28,11 @@ def clean_time(t_str: str) -> str:
     return parts[-1] if len(parts) > 1 else t_str
 
 
-def check_one_monitor(monitor: Dict[str, Any], save_history: bool = True) -> Dict[str, Any]:
+def check_one_monitor(
+    monitor: Dict[str, Any],
+    save_history: bool = True,
+    scheduled_report: bool = False,
+) -> Dict[str, Any]:
     """檢查單一監控項目，回傳結果摘要"""
     origin = monitor["origin"]
     destination = monitor["destination"]
@@ -91,10 +95,10 @@ def check_one_monitor(monitor: Dict[str, Any], save_history: bool = True) -> Dic
     price_changed = last_price is not None and best is not None and best != last_price
 
     # 只要設定 ALWAYS_NOTIFY=True，或者達標、或價格變動，就發送通知
-    should_notify = ALWAYS_NOTIFY or hit or price_changed
+    should_notify = scheduled_report or ALWAYS_NOTIFY or hit or price_changed
 
     if should_notify:
-        recent = (
+        recent = None if scheduled_report else (
             db.recent_success_notification(monitor_id, hours=NOTIFY_COOLDOWN_HOURS)
             if NOTIFY_COOLDOWN_HOURS > 0
             else None
@@ -221,7 +225,8 @@ def check_one_monitor(monitor: Dict[str, Any], save_history: bool = True) -> Dic
 
             msg = (
                 f"{title}\n"
-                f"路線：{origin_name} → {dest_name}\n"
+                + (f"排程回報：{datetime.now().strftime('%Y-%m-%d %H:%M')}\n" if scheduled_report else "")
+                + f"路線：{origin_name} → {dest_name}\n"
                 f"日期：{outbound_date}" + (f" / 回程 {return_date}" if return_date else "") + "\n"
                 f"條件：{adults} 位成人 · {class_name}\n"
             )
@@ -237,10 +242,14 @@ def check_one_monitor(monitor: Dict[str, Any], save_history: bool = True) -> Dic
             msg += f"資料來源：{source_name}。下單前請再次確認最終價格。"
 
             # Prevent two scheduler processes from delivering the same report at once.
-            window_seconds = max(300, int(NOTIFY_COOLDOWN_HOURS * 3600))
-            window_id = int(datetime.now().timestamp() // window_seconds)
+            if scheduled_report:
+                claim_scope = f"scheduled:{datetime.now().strftime('%Y-%m-%d-%H')}"
+            else:
+                window_seconds = max(300, int(NOTIFY_COOLDOWN_HOURS * 3600))
+                window_id = int(datetime.now().timestamp() // window_seconds)
+                claim_scope = f"window:{window_id}"
             dedupe_key = hashlib.sha256(
-                f"monitor:{monitor_id}:window:{window_id}".encode("utf-8")
+                f"monitor:{monitor_id}:{claim_scope}".encode("utf-8")
             ).hexdigest()
             if not db.claim_notification(
                 monitor_id,
@@ -276,10 +285,10 @@ def check_one_monitor(monitor: Dict[str, Any], save_history: bool = True) -> Dic
     }
 
 
-def check_all_monitors() -> List[Dict[str, Any]]:
+def check_all_monitors(scheduled_report: bool = False) -> List[Dict[str, Any]]:
     db.expire_monitors()  # 自動停用已過出發日的監控，節省 API 額度
     monitors = db.list_monitors(active_only=True)
-    results = [check_one_monitor(m) for m in monitors]
+    results = [check_one_monitor(m, scheduled_report=scheduled_report) for m in monitors]
     maybe_send_quota_warnings(send_all)
     return results
 

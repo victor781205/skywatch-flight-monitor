@@ -118,7 +118,7 @@ def job():
     log_message("開始執行定時查價監控…")
     _write_status(state="running", last_started_at=_now().isoformat(timespec="seconds"), last_error=None)
     try:
-        results = check_all_monitors()
+        results = check_all_monitors(scheduled_report=True)
         for r in results:
             if not r.get("ok"):
                 log_message(f"  ❌ #{r.get('monitor_id')} 失敗: {r.get('error')}")
