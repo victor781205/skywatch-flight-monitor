@@ -10,7 +10,6 @@ flowchart LR
   S[APScheduler service] --> M[Monitor engine]
   M --> API
   API --> EXT[SerpAPI / Google Flights data]
-  API -. optional fallback .-> AMD[Amadeus Flight Offers]
   UI --> DB[(SQLite)]
   M --> DB
   M --> N[Notification dispatcher]
@@ -25,8 +24,7 @@ flowchart LR
 - `app.py`: six-page UI, health surfaces, search and monitor controls.
 - `scheduler.py`: production APScheduler service, timezone, process lock, and
   heartbeat persistence.
-- `src/flight_api.py`: validation, provider orchestration, and SerpAPI adapter.
-- `src/amadeus.py`: optional Amadeus OAuth and Flight Offers adapter.
+- `src/flight_api.py`: validation, SerpAPI adapter, and operation telemetry.
 - `src/api_usage.py`: monthly quota summaries, projections, and warning policy.
 - `src/monitor.py`: quote persistence, alert policy, message construction, and
   scheduler-window deduplication.
@@ -50,14 +48,12 @@ Failed channel deliveries release their payload claim so a later run can retry.
 ## Fare-search and quota flow
 
 1. Each routine scheduled monitor performs one primary fare search.
-2. If the primary provider fails or returns no offers, an available configured
-   fallback is attempted.
-3. Preferred-airline summaries reuse the primary response.
-4. Only a target-price hit may request the top itinerary's return and booking
+2. Preferred-airline summaries reuse the primary response.
+3. Only a target-price hit may request the top itinerary's return and booking
    details.
-5. Successful requests are counted by provider and operation. No route, date,
+4. Successful requests are counted by provider and operation. No route, date,
    passenger, credential, or response content is written to usage telemetry.
-6. A database claim permits one quota warning per provider, month, and threshold.
+5. A database claim permits one quota warning per provider, month, and threshold.
 
 ## Data and trust boundaries
 

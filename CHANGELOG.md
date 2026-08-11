@@ -7,6 +7,8 @@ All notable changes to SkyWatch are documented here. The project follows
 
 - Prepare public open-source governance and GitHub automation.
 - Replace machine-specific Windows launch paths with portable project-relative paths.
+- Remove the Amadeus fallback from runtime and settings because it is not an
+  available credential path for this project's owner.
 
 ## [2.4.0] - 2026-08-11
 

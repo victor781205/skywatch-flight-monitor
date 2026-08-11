@@ -24,13 +24,9 @@ from src import database as db
 from src.api_usage import estimate_monthly_primary_searches, quota_summaries
 from src.airports import get_label, options_for_select
 from src.config import (
-    AMADEUS_CLIENT_ID,
-    AMADEUS_CLIENT_SECRET,
     API_USAGE_WARNING_PERCENT,
     ALWAYS_NOTIFY,
     APP_VERSION,
-    FLIGHT_API_FALLBACK,
-    FLIGHT_API_PROVIDER,
     MONITOR_FETCH_DETAILS_ON_HIT,
     NOTIFY_COOLDOWN_HOURS,
     SERPAPI_API_KEY,
@@ -63,7 +59,7 @@ def _safe(value: object) -> str:
 
 
 def flight_api_ready() -> bool:
-    return bool(SERPAPI_API_KEY or (AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET))
+    return bool(SERPAPI_API_KEY)
 
 
 def get_scheduler_health() -> dict:
@@ -358,7 +354,7 @@ def sidebar():
         st.markdown("---")
         channels = configured_channels()
         api_ok = flight_api_ready()
-        api_label = "SerpAPI 已連線" if SERPAPI_API_KEY else "Amadeus 已連線"
+        api_label = "SerpAPI 已連線"
         api_row = (
             f'<div class="sb-status-row"><span class="status-dot dot-on"></span>{api_label}</div>'
             if api_ok
@@ -1185,11 +1181,7 @@ def page_settings():
     with col1:
         st.html('<div class="section-label">連線狀態</div>')
         st.write(f"**SerpAPI：** {'已設定' if SERPAPI_API_KEY else '未設定'}")
-        st.write(
-            f"**Amadeus 備援：** "
-            f"{'已設定' if AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET else '未設定（可選）'}"
-        )
-        st.write(f"**提供者順序：** {FLIGHT_API_PROVIDER} → {FLIGHT_API_FALLBACK or '無'}")
+        st.write("**查詢策略：** 單次主查詢 → 達標後補查詳細資料")
         st.write("**通知管道：** " + "、".join(configured_channels()))
         st.markdown(
             f"""
@@ -1197,10 +1189,6 @@ def page_settings():
 
             ```env
             SERPAPI_API_KEY=...
-            FLIGHT_API_PROVIDER=serpapi
-            FLIGHT_API_FALLBACK=amadeus
-            AMADEUS_CLIENT_ID=...
-            AMADEUS_CLIENT_SECRET=...
             DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
             TELEGRAM_BOT_TOKEN=...
             TELEGRAM_CHAT_ID=...

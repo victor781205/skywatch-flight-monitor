@@ -8,7 +8,6 @@ from typing import Any, Callable, Dict, List
 
 from . import database as db
 from .config import (
-    AMADEUS_MONTHLY_LIMIT,
     API_USAGE_WARNING_PERCENT,
     SERPAPI_MONTHLY_LIMIT,
 )
@@ -40,7 +39,6 @@ def estimate_monthly_primary_searches(active_monitors: int, now: datetime | None
 def quota_summaries(now: datetime | None = None) -> List[Dict[str, Any]]:
     return [
         db.get_api_usage_summary("serpapi", SERPAPI_MONTHLY_LIMIT, now=now),
-        db.get_api_usage_summary("amadeus", AMADEUS_MONTHLY_LIMIT, now=now),
     ]
 
 
@@ -56,7 +54,7 @@ def maybe_send_quota_warnings(
             continue
         if not db.claim_api_quota_warning(summary["provider"], summary["period"], threshold):
             continue
-        provider_name = "SerpAPI" if summary["provider"] == "serpapi" else "Amadeus"
+        provider_name = "SerpAPI"
         message = (
             f"⚠️ SkyWatch API 免費額度提醒\n"
             f"{provider_name} 本月已使用 {summary['used']} / {summary['limit']} 次 "

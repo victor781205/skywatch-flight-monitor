@@ -231,7 +231,7 @@ def check_one_monitor(monitor: Dict[str, Any], save_history: bool = True) -> Dic
             msg += f"{top_msg}\n"
             msg += f"🏆 【三大國籍航空】\n\n"
             msg += "\n".join(pure_blocks) + "\n\n"
-            source_name = "Google Flights / SerpAPI" if result.get("provider") == "serpapi" else "Amadeus"
+            source_name = "Google Flights / SerpAPI"
             if not hit:
                 msg += "額度節省模式：達標時才補查回程與開票平台。\n"
             msg += f"資料來源：{source_name}。下單前請再次確認最終價格。"

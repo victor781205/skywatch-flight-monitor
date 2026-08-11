@@ -22,7 +22,6 @@ SkyWatch 是可自行部署的本機航班票價監控工作台，提供繁體�
 - Run monitoring at fixed Asia/Taipei times or a configurable interval.
 - Send scheduled reports and target-price alerts through Telegram or Discord.
 - Conserve free API quota by using one primary search per routine monitor run.
-- Optionally fall back from SerpAPI to Amadeus Self-Service when credentials are configured.
 - Track successful monthly API requests and warn once when usage reaches 80%.
 - Prevent duplicate alerts with process locks, atomic database claims, cooldowns,
   and per-channel exact-message fingerprints.
@@ -82,16 +81,8 @@ Edit `.env`:
 
 ```env
 SERPAPI_API_KEY=
-FLIGHT_API_PROVIDER=serpapi
-FLIGHT_API_FALLBACK=amadeus
 SERPAPI_MONTHLY_LIMIT=250
 API_USAGE_WARNING_PERCENT=80
-
-# Optional fallback
-AMADEUS_CLIENT_ID=
-AMADEUS_CLIENT_SECRET=
-AMADEUS_ENV=test
-AMADEUS_MONTHLY_LIMIT=0
 
 MONITOR_FETCH_DETAILS_ON_HIT=true
 DISCORD_WEBHOOK_URL=
@@ -148,10 +139,9 @@ plan. SkyWatch counts successful requests locally, projects scheduled monthly
 usage, and sends one warning per provider and month at
 `API_USAGE_WARNING_PERCENT`.
 
-Amadeus is an optional fallback. Its `test` environment contains limited cached
-data; set `AMADEUS_ENV=production` only after your Amadeus application has
-production access and you understand its billing controls. A provider key is
-never committed or included in usage telemetry.
+Provider keys are never committed or included in usage telemetry. Additional
+fare providers should only be enabled after confirming that the project owner
+can obtain and legally use production credentials.
 
 The UI process does not start a second scheduler. See
 [Architecture](docs/ARCHITECTURE.md) for the complete flow.
