@@ -125,11 +125,14 @@ Duplicate prevention is layered:
 2. A filesystem lock permits one scheduler process to check monitors.
 3. SQLite atomically claims each notification window.
 4. Each external channel claims a fingerprint of the complete message.
-5. Successful external notifications participate in the configured cooldown.
+5. Fixed schedule slots and per-channel payload claims prevent duplicate delivery.
 
-Routine round-trip reports use one primary search plus one return-detail request
-for the top itinerary. Booking-provider details remain target-hit only. SkyWatch
-does not perform one detail request per preferred airline during scheduled runs.
+Routine round-trip reports use one primary search and fetch return details for
+the top itinerary plus each of EVA Air, China Airlines, and STARLUX when those
+airlines appear in the primary response. Repeated departure tokens share a
+lookup result. Booking-provider details remain target-hit only. A report may
+therefore consume up to five SerpAPI requests; two daily runs can exceed a
+250-request free month, so the settings page shows a worst-case projection.
 
 ## Flight-data providers and quota
 

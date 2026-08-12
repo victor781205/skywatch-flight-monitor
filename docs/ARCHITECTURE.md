@@ -43,7 +43,7 @@ flowchart LR
    window.
 4. A second per-channel fingerprint blocks an identical message payload even if
    it arrives through another trigger path.
-5. Successful external notifications participate in the configurable cooldown.
+5. Fixed schedule slots and per-channel payload claims prevent duplicate delivery.
 
 Failed channel deliveries release their payload claim so a later run can retry.
 
@@ -51,8 +51,9 @@ Failed channel deliveries release their payload claim so a later run can retry.
 
 1. Each routine scheduled monitor performs one primary fare search.
 2. Preferred-airline summaries reuse the primary response.
-3. Fixed round-trip reports request return details for the top itinerary;
-   booking-provider details remain target-hit only.
+3. Fixed round-trip reports request return details for the top itinerary and
+   each matched Taiwanese full-service airline, reusing identical departure
+   tokens; booking-provider details remain target-hit only.
 4. Successful requests are counted by provider and operation. No route, date,
    passenger, credential, or response content is written to usage telemetry.
 5. A database claim permits one quota warning per provider, month, and threshold.

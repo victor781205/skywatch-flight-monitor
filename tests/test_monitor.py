@@ -173,6 +173,76 @@ class MonitorTests(unittest.TestCase):
         booking_details.assert_not_called()
         self.assertIn("回程：Test Air TA2", send_mock.call_args.args[0])
 
+    def test_fixed_schedule_fetches_each_premium_return_once(self):
+        monitor = {
+            "id": 1,
+            "route_id": 7,
+            "origin": "TPE",
+            "destination": "BKK",
+            "outbound_date": "2026-09-01",
+            "return_date": "2026-09-08",
+            "target_price": 15000,
+            "adults": 1,
+            "travel_class": 1,
+            "last_price": 20000.0,
+        }
+        search_result = self._round_trip_result()
+        search_result["best_price"] = 17000.0
+        search_result["flights"] = [
+            {
+                "price": 17000.0,
+                "airline": airline,
+                "stops": 0,
+                "duration": "3h",
+                "departure_time": "2026-09-01 09:00",
+                "arrival_time": "2026-09-01 12:00",
+                "flight_number": outbound_number,
+                "departure_token": token,
+            }
+            for airline, outbound_number, token in (
+                ("EVA Air", "BR101", "eva-token"),
+                ("China Airlines", "CI101", "china-token"),
+                ("STARLUX Airlines", "JX101", "starlux-token"),
+            )
+        ]
+        return_numbers = {
+            "eva-token": ("EVA Air", "BR102"),
+            "china-token": ("China Airlines", "CI102"),
+            "starlux-token": ("STARLUX Airlines", "JX102"),
+        }
+
+        def return_for(token, *_args, **_kwargs):
+            airline, number = return_numbers[token]
+            return {
+                "airline": airline,
+                "flight_number": number,
+                "departure_time": "2026-09-08 09:00",
+                "arrival_time": "2026-09-08 12:00",
+            }
+
+        with (
+            patch("src.monitor.search_flights", return_value=search_result),
+            patch("src.monitor.get_return_flight_info", side_effect=return_for) as return_details,
+            patch("src.monitor.get_booking_provider") as booking_details,
+            patch("src.monitor.get_label", side_effect=lambda code: code),
+            patch("src.monitor.db.update_monitor_check"),
+            patch("src.monitor.db.add_price_record"),
+            patch("src.monitor.db.claim_notification", return_value=True),
+            patch("src.monitor.send_all", return_value=[("Telegram", True, "ok")]) as send_mock,
+            patch("src.monitor.ALWAYS_NOTIFY", True),
+            patch("src.monitor.MONITOR_FETCH_DETAILS_ON_HIT", True),
+        ):
+            result = check_one_monitor(monitor, scheduled_report=True)
+
+        self.assertFalse(result["hit"])
+        self.assertEqual(return_details.call_count, 3)
+        booking_details.assert_not_called()
+        message = send_mock.call_args.args[0]
+        self.assertIn("來回總價：TWD 17,000", message)
+        self.assertIn("回程：BR102", message)
+        self.assertIn("回程：CI102", message)
+        self.assertIn("回程：JX102", message)
+
     def test_hit_fetches_only_top_flight_details(self):
         monitor = {
             "id": 1,

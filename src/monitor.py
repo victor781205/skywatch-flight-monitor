@@ -132,6 +132,7 @@ def check_one_monitor(
 
             top_ret_str = ""
             top_provider_str = ""
+            return_details_cache: Dict[str, Optional[Dict[str, Any]]] = {}
             ret_info = top_flight.get("return_flight") if top_flight else None
             should_fetch_details = bool(
                 (hit or scheduled_report)
@@ -142,15 +143,18 @@ def check_one_monitor(
                 and top_flight.get("departure_token")
             )
             if should_fetch_details:
+                top_token = top_flight["departure_token"]
                 ret_info = get_return_flight_info(
-                    top_flight["departure_token"],
+                    top_token,
                     origin,
                     destination,
                     outbound_date,
                     return_date,
+                    target_airline=top_airline,
                     adults=adults,
                     travel_class=travel_class,
                 )
+                return_details_cache[top_token] = ret_info
             if ret_info:
                 r_air = ret_info.get("airline", "")
                 r_num = ret_info.get("flight_number", "")
@@ -175,7 +179,7 @@ def check_one_monitor(
 
             top_msg = (
                 f"🌟 【最推薦組合】\n"
-                f"總價：TWD {best:,.0f} {per_person}\n"
+                f"{'來回總價' if return_date else '單程總價'}：TWD {best:,.0f} {per_person}\n"
                 f"   去程：{top_airline} {top_dep_num}{top_dep_plane} {top_dep_time} - {top_arr_time}\n"
                 f"{top_ret_str}"
                 f"{top_provider_str}"
@@ -210,15 +214,40 @@ def check_one_monitor(
                         arr_t = clean_time(matched.get("arrival_time", ""))
                         block = (
                             f"✈️ {name}\n"
-                            f"總價：TWD {p_total:,.0f} {p_person_str}\n"
+                            f"{'來回總價' if return_date else '單程總價'}：TWD {p_total:,.0f} {p_person_str}\n"
                             f"   去程：{f_num}{f_plane} {dep_t} - {arr_t}\n"
                         )
                         matched_return = matched.get("return_flight")
+                        matched_token = matched.get("departure_token")
+                        if (
+                            not matched_return
+                            and scheduled_report
+                            and MONITOR_FETCH_DETAILS_ON_HIT
+                            and return_date
+                            and matched_token
+                        ):
+                            if matched_token in return_details_cache:
+                                matched_return = return_details_cache[matched_token]
+                            else:
+                                matched_return = get_return_flight_info(
+                                    matched_token,
+                                    origin,
+                                    destination,
+                                    outbound_date,
+                                    return_date,
+                                    target_airline=name,
+                                    keywords=keywords,
+                                    adults=adults,
+                                    travel_class=travel_class,
+                                )
+                                return_details_cache[matched_token] = matched_return
                         if matched_return:
                             r_num = matched_return.get("flight_number", "")
                             r_dep = clean_time(matched_return.get("departure_time", ""))
                             r_arr = clean_time(matched_return.get("arrival_time", ""))
                             block += f"   回程：{r_num} {r_dep} - {r_arr}\n"
+                        elif return_date:
+                            block += "   回程：目前查無同航空公司組合\n"
                         pure_blocks.append(block)
                     else:
                         pure_blocks.append(f"✈️ {name}：未找到同航空公司來回組合\n")
@@ -239,7 +268,7 @@ def check_one_monitor(
             source_name = "Google Flights / SerpAPI"
             if not hit:
                 if scheduled_report and return_date:
-                    msg += "固定回報已補查最推薦回程；開票平台達標時才查。\n"
+                    msg += "固定回報已補查最推薦與國籍航空回程；開票平台達標時才查。\n"
                 else:
                     msg += "額度節省模式：固定排程或達標時才補查回程。\n"
             msg += f"資料來源：{source_name}。下單前請再次確認最終價格。"

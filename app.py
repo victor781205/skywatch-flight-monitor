@@ -1232,7 +1232,7 @@ def page_settings():
         st.html('<div class="section-label">連線狀態</div>')
         st.write(f"**SerpAPI：** {'已設定' if SERPAPI_API_KEY else '未設定'}")
         st.write(f"**Travelpayouts 趨勢：** {'已設定' if travelpayouts_ready() else '未設定（可選）'}")
-        st.write("**查詢策略：** 主查詢 → 固定報告補回程 → 達標後查開票平台")
+        st.write("**查詢策略：** 主查詢 → 補最推薦與三大國籍航空回程 → 達標查開票平台")
         st.write("**通知管道：** " + "、".join(configured_channels()))
         st.markdown(
             f"""
@@ -1251,7 +1251,7 @@ def page_settings():
             目前策略：**{'每次查價均通知' if ALWAYS_NOTIFY else '僅達標或價格變動時通知'}**
             固定回報：**每日 00:00 / 12:00 必送**
             手動冷卻：**{NOTIFY_COOLDOWN_HOURS:g} 小時**
-            詳細補查：**{'固定報告補回程；達標後查開票平台' if MONITOR_FETCH_DETAILS_ON_HIT else '停用'}**
+            詳細補查：**{'固定報告補最推薦與國籍航空回程；達標後查開票平台' if MONITOR_FETCH_DETAILS_ON_HIT else '停用'}**
             """
         )
     with col2:
@@ -1267,7 +1267,10 @@ def page_settings():
     st.html('<div class="section-label">API 免費額度</div>')
     summaries = quota_summaries()
     serp_summary = summaries[0]
-    estimated_monthly = estimate_monthly_primary_searches(len(active_monitors))
+    estimated_primary = estimate_monthly_primary_searches(len(active_monitors))
+    round_trip_monitors = sum(1 for monitor in active_monitors if monitor.get("return_date"))
+    estimated_return_details_max = estimate_monthly_primary_searches(round_trip_monitors) * 4
+    estimated_monthly = estimated_primary + estimated_return_details_max
     qc1, qc2, qc3, qc4 = st.columns(4)
     qc1.metric(
         "SerpAPI 本月",
@@ -1278,7 +1281,11 @@ def page_settings():
         "免費剩餘",
         f"{serp_summary['remaining']} 次" if serp_summary["remaining"] is not None else "未設定",
     )
-    qc3.metric("排程月預估", f"{estimated_monthly} 次", f"{len(active_monitors)} 個啟用監控")
+    qc3.metric(
+        "排程月預估上限",
+        f"{estimated_monthly} 次",
+        f"主查詢 {estimated_primary} + 回程最多 {estimated_return_details_max}",
+    )
     usage_percent = serp_summary.get("percent") or 0.0
     qc4.metric("額度狀態", "注意" if usage_percent >= API_USAGE_WARNING_PERCENT else "正常", f"{usage_percent:.0f}%")
     if serp_summary["limit"]:
