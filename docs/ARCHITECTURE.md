@@ -17,12 +17,15 @@ flowchart LR
   N --> TG[Telegram]
   N --> DC[Discord]
   S --> H[Scheduler heartbeat JSON]
+  H --> W[Telegram bot watchdog]
+  W --> TG
   H --> UI
 ```
 
 ## Modules
 
-- `app.py`: six-page UI, health surfaces, search and monitor controls.
+- `app.py`: eight-page light operations UI covering search, monitoring,
+  price intelligence, run history, settings, and credential-free backups.
 - `scheduler.py`: production APScheduler service, timezone, process lock, and
   heartbeat persistence.
 - `src/flight_api.py`: validation, SerpAPI adapter, and operation telemetry.
@@ -36,7 +39,8 @@ flowchart LR
 
 ## Duplicate-notification controls
 
-1. APScheduler limits each job to one in-process instance.
+1. One durable supervisor owns fixed, daily, and interval slots; sleep/wake
+   misfires cannot create a second shifted schedule.
 2. `data/scheduler.lock` prevents concurrent scheduler processes from checking
    the same monitor set.
 3. A database claim prevents concurrent delivery in the same notification
@@ -44,19 +48,22 @@ flowchart LR
 4. A second per-channel fingerprint blocks an identical message payload even if
    it arrives through another trigger path.
 5. Fixed schedule slots and per-channel payload claims prevent duplicate delivery.
+6. Stale `running` ledger leases are atomically reclaimed after a crash.
 
 Failed channel deliveries release their payload claim so a later run can retry.
 
 ## Fare-search and quota flow
 
-1. Each routine scheduled monitor performs one primary fare search.
-2. Preferred-airline summaries reuse the primary response.
-3. Fixed round-trip reports request return details for the top itinerary and
-   each matched Taiwanese full-service airline, reusing identical departure
-   tokens; booking-provider details remain target-hit only.
-4. Successful requests are counted by provider and operation. No route, date,
+1. Every run starts with one primary fare search.
+2. The selected quota mode hard-caps the run at 1, 2, or 5 provider requests.
+3. Standard mode may enrich the best return itinerary. Full mode prioritizes
+   return details for the best itinerary and each matched Taiwanese
+   full-service airline, while repeated departure tokens share one lookup.
+4. Booking-provider details are target-hit only and use any budget remaining
+   after those return-itinerary priorities.
+5. Every attempted request is counted by provider and operation. No route, date,
    passenger, credential, or response content is written to usage telemetry.
-5. A database claim permits one quota warning per provider, month, and threshold.
+6. A database claim permits one quota warning per provider, month, and threshold.
 
 Travelpayouts is deliberately outside the alert path. It runs only with a
 user-initiated UI search, is labelled as cached, and cannot cause a target-price

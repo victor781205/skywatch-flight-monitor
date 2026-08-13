@@ -11,6 +11,11 @@ TRAVELPAYOUTS_TOKEN = os.getenv("TRAVELPAYOUTS_TOKEN", "")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_ALLOWED_CHAT_IDS = {
+    value.strip()
+    for value in os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", TELEGRAM_CHAT_ID).split(",")
+    if value.strip()
+}
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -44,13 +49,29 @@ try:
 except ValueError:
     NOTIFY_COOLDOWN_HOURS = 0.0
 
+SCHEDULER_TICK_MINUTES = max(1, _positive_int("SCHEDULER_TICK_MINUTES", 5))
+SCHEDULER_HEARTBEAT_STALE_MINUTES = max(
+    3,
+    _positive_int(
+        "SCHEDULER_HEARTBEAT_STALE_MINUTES",
+        max(15, SCHEDULER_TICK_MINUTES * 3),
+    ),
+)
+MISSED_RUN_LOOKBACK_HOURS = max(1, _positive_int("MISSED_RUN_LOOKBACK_HOURS", 24))
+OUTBOX_MAX_ATTEMPTS = max(1, _positive_int("OUTBOX_MAX_ATTEMPTS", 4))
+TELEGRAM_COMMANDS_ENABLED = os.getenv("TELEGRAM_COMMANDS_ENABLED", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
 # 完全相同的報價內容即使被不同程序同時觸發，也只允許每個管道送出一次。
 try:
     MESSAGE_DEDUPE_HOURS = max(1.0, float(os.getenv("MESSAGE_DEDUPE_HOURS", "24")))
 except ValueError:
     MESSAGE_DEDUPE_HOURS = 24.0
 
-APP_VERSION = "2.5.0"
+APP_VERSION = "3.0.0"
 
 DB_PATH = BASE_DIR / "data" / "flights.db"
 DATA_DIR = BASE_DIR / "data"

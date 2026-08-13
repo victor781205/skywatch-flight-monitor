@@ -2,7 +2,7 @@
 
 1. Confirm the working tree contains no `.env`, database, logs, or user exports.
 2. Run `python -m unittest discover -s tests -v`.
-3. Run `python -m compileall -q app.py scheduler.py src tests`.
+3. Run `python -m compileall -q app.py scheduler.py telegram_bot.py src tests`.
 4. Update `CHANGELOG.md` and `src/config.py`.
 5. Review dependency and external-service changes.
 6. Create an annotated tag such as `v0.2.3`.

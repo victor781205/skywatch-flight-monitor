@@ -12,10 +12,17 @@ __pycache__/
 # Runtime data
 data/*.db
 data/*.db-*
+data/**/*.db
+data/**/*.db-*
+data/**/*.sqlite
+data/**/*.sqlite-*
+data/backups/
 data/*.log
 data/*.log.*
 data/*.lock
 data/scheduler_status.json
+data/telegram_offset.json
+data/telegram_watchdog.json
 data/airports_iata.csv
 data/airports_iata.json
 legacy/

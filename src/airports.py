@@ -19,6 +19,7 @@ from .config import DATA_DIR
 AIRPORTS_CSV = DATA_DIR / "airports_iata.csv"
 AIRPORTS_JSON = DATA_DIR / "airports_iata.json"
 OURAIRPORTS_URL = "https://davidmegginson.github.io/ourairports-data/airports.csv"
+_AIRPORT_DATA_SOURCE = "unknown"
 
 # 額外關鍵字（城市別名 → 可命中的 IATA）
 CITY_KEYWORDS: Dict[str, List[str]] = {
@@ -140,6 +141,39 @@ ZH_ALIASES: Dict[str, str] = {
 }
 
 
+def _fallback_airports() -> List[Dict[str, str]]:
+    """Return a useful offline index when the first download is unavailable."""
+    preferred = [
+        "TPE", "TSA", "KHH", "RMQ", "NRT", "HND", "KIX", "ITM", "NGO",
+        "FUK", "CTS", "OKA", "ICN", "GMP", "PUS", "HKG", "MFM", "BKK",
+        "DMK", "SIN", "KUL", "MNL", "SGN", "HAN", "DAD", "PVG", "SHA",
+        "PEK", "PKX", "LAX", "SFO", "JFK", "EWR", "LHR", "CDG", "FRA",
+        "AMS", "SYD", "MEL", "DXB", "DOH", "IST",
+    ]
+    rows: List[Dict[str, str]] = []
+    for code in preferred:
+        label = ZH_ALIASES.get(code, code)
+        rows.append(
+            {
+                "iata": code,
+                "name": label,
+                "city": label,
+                "country": "",
+                "type": "large_airport",
+                "lat": "",
+                "lon": "",
+                "zh": label,
+                "label": _make_label(code, label, label, "", label),
+            }
+        )
+    return rows
+
+
+def airport_data_status() -> str:
+    """Return ``local`` or ``fallback`` after the airport index is loaded."""
+    return _AIRPORT_DATA_SOURCE
+
+
 def ensure_airport_data(force: bool = False) -> Path:
     """確保本機有機場清單；若無則下載 OurAirports 並篩出有 IATA 的機場。"""
     if AIRPORTS_CSV.exists() and AIRPORTS_JSON.exists() and not force:
@@ -222,20 +256,34 @@ def _make_label(iata: str, name: str, city: str, country: str, zh: str = "") -> 
 
 @lru_cache(maxsize=1)
 def load_airports() -> List[Dict[str, str]]:
-    ensure_airport_data()
+    global _AIRPORT_DATA_SOURCE
+    try:
+        ensure_airport_data()
+    except (requests.RequestException, OSError, UnicodeError, csv.Error):
+        _AIRPORT_DATA_SOURCE = "fallback"
+        return _fallback_airports()
     items: List[Dict[str, str]] = []
-    with AIRPORTS_CSV.open("r", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            items.append(dict(r))
+    try:
+        with AIRPORTS_CSV.open("r", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                items.append(dict(r))
+    except (OSError, UnicodeError, csv.Error):
+        _AIRPORT_DATA_SOURCE = "fallback"
+        return _fallback_airports()
+    _AIRPORT_DATA_SOURCE = "local"
     return items
 
 
 @lru_cache(maxsize=1)
 def airport_label_map() -> Dict[str, str]:
     """iata -> label"""
-    ensure_airport_data()
     if AIRPORTS_JSON.exists():
-        return json.loads(AIRPORTS_JSON.read_text(encoding="utf-8"))
+        try:
+            payload = json.loads(AIRPORTS_JSON.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return {str(code): str(label) for code, label in payload.items()}
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
     return {a["iata"]: a["label"] for a in load_airports()}
 
 

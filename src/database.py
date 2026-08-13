@@ -1,13 +1,27 @@
 """SQLite 資料庫：航線、價格歷史、監控提醒"""
 from __future__ import annotations
 
+import json
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from .config import DB_PATH
+
+
+_OUTBOX_TIMEZONE = ZoneInfo("Asia/Taipei")
+
+
+def _outbox_time(value: Optional[datetime] = None) -> datetime:
+    """Normalise queue clocks to Taipei local-naive for sortable SQLite text."""
+    current = value or datetime.now(_OUTBOX_TIMEZONE)
+    if current.tzinfo is None:
+        return current
+    return current.astimezone(_OUTBOX_TIMEZONE).replace(tzinfo=None)
 
 
 def _connect() -> sqlite3.Connection:
@@ -116,6 +130,61 @@ def init_db() -> None:
                 PRIMARY KEY (provider, period, threshold)
             );
 
+            CREATE TABLE IF NOT EXISTS check_runs (
+                id TEXT PRIMARY KEY,
+                monitor_id INTEGER,
+                trigger TEXT NOT NULL DEFAULT 'scheduled',
+                scheduled_slot TEXT,
+                status TEXT NOT NULL DEFAULT 'running',
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                duration_ms INTEGER,
+                api_calls INTEGER NOT NULL DEFAULT 0,
+                error_stage TEXT,
+                error_message TEXT,
+                backfill INTEGER NOT NULL DEFAULT 0,
+                result_json TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(monitor_id) REFERENCES monitors(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS notification_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT,
+                monitor_id INTEGER,
+                channel TEXT NOT NULL,
+                message TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 4,
+                next_attempt_at TEXT NOT NULL,
+                last_error TEXT,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                sent_at TEXT,
+                FOREIGN KEY(run_id) REFERENCES check_runs(id) ON DELETE SET NULL,
+                FOREIGN KEY(monitor_id) REFERENCES monitors(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS carrier_quotes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT,
+                monitor_id INTEGER,
+                route_id INTEGER NOT NULL,
+                carrier_code TEXT,
+                carrier_name TEXT,
+                total_price REAL NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'TWD',
+                outbound_json TEXT NOT NULL DEFAULT '{}',
+                return_json TEXT NOT NULL DEFAULT '{}',
+                stops INTEGER NOT NULL DEFAULT 0,
+                recorded_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES check_runs(id) ON DELETE SET NULL,
+                FOREIGN KEY(monitor_id) REFERENCES monitors(id) ON DELETE SET NULL,
+                FOREIGN KEY(route_id) REFERENCES routes(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS schema_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -129,14 +198,35 @@ def init_db() -> None:
                 ON notification_claims(created_at);
             CREATE INDEX IF NOT EXISTS idx_api_usage_provider_created
                 ON api_usage(provider, created_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_check_runs_monitor_slot
+                ON check_runs(monitor_id, scheduled_slot)
+                WHERE monitor_id IS NOT NULL AND scheduled_slot IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_check_runs_started
+                ON check_runs(started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_outbox_due
+                ON notification_outbox(status, next_attempt_at);
+            CREATE INDEX IF NOT EXISTS idx_carrier_quotes_monitor_recorded
+                ON carrier_quotes(monitor_id, recorded_at DESC);
             """
         )
 
         # Legacy databases created before v2.1 do not contain travel_class.
         _ensure_column(conn, "price_history", "travel_class", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(conn, "monitors", "travel_class", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "monitors", "quota_mode", "TEXT NOT NULL DEFAULT 'full'")
+        _ensure_column(conn, "monitors", "airline_rules_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "monitors", "schedule_type", "TEXT NOT NULL DEFAULT 'global'")
+        _ensure_column(conn, "monitors", "schedule_value", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "monitors", "notification_policy", "TEXT NOT NULL DEFAULT 'always'")
+        _ensure_column(conn, "monitors", "quiet_hours_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(conn, "monitors", "next_run_at", "TEXT")
+        _ensure_column(conn, "monitors", "last_run_id", "TEXT")
+        _ensure_column(conn, "monitors", "schedule_effective_at", "TEXT")
         conn.execute(
-            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '3') "
+            "UPDATE monitors SET schedule_effective_at=COALESCE(schedule_effective_at, created_at)"
+        )
+        conn.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '7') "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
         )
 
@@ -306,6 +396,13 @@ def add_monitor(
     travel_class: int = 1,
     trip_type: str = "one_way",
     allow_duplicate: bool = False,
+    quota_mode: str = "full",
+    airline_rules: Optional[List[Dict[str, Any]]] = None,
+    schedule_type: str = "global",
+    schedule_value: str = "",
+    notification_policy: str = "always",
+    quiet_hours: Optional[Dict[str, Any]] = None,
+    next_run_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     新增監控。預設防重複：
@@ -313,13 +410,47 @@ def add_monitor(
     - 否則新增
     回傳 {"id": int, "created": bool, "updated": bool, "duplicate": bool}
     """
+    if quota_mode not in {"lean", "standard", "full"}:
+        raise ValueError("quota_mode must be lean, standard, or full")
+    if schedule_type not in {"global", "fixed_times", "daily", "interval"}:
+        raise ValueError("unsupported schedule_type")
+    if notification_policy not in {"always", "target_only", "price_drop", "digest"}:
+        raise ValueError("unsupported notification_policy")
+    now_stamp = datetime.now().isoformat(timespec="seconds")
     if not allow_duplicate:
         existing = find_duplicate_monitor(route_id, outbound_date, return_date, adults, travel_class, active_only=True)
         if existing:
+            schedule_changed = (
+                str(existing.get("schedule_type") or "global") != schedule_type
+                or str(existing.get("schedule_value") or "") != schedule_value
+            )
+            schedule_effective_at = (
+                now_stamp
+                if schedule_changed
+                else existing.get("schedule_effective_at") or existing.get("created_at") or now_stamp
+            )
             with get_db() as conn:
                 conn.execute(
-                    "UPDATE monitors SET target_price=?, trip_type=? WHERE id=?",
-                    (target_price, trip_type, existing["id"]),
+                    """
+                    UPDATE monitors SET target_price=?, trip_type=?, quota_mode=?,
+                        airline_rules_json=?, schedule_type=?, schedule_value=?,
+                        notification_policy=?, quiet_hours_json=?, next_run_at=?,
+                        schedule_effective_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        target_price,
+                        trip_type,
+                        quota_mode,
+                        json.dumps(airline_rules or [], ensure_ascii=False),
+                        schedule_type,
+                        schedule_value,
+                        notification_policy,
+                        json.dumps(quiet_hours or {}, ensure_ascii=False),
+                        next_run_at,
+                        schedule_effective_at,
+                        existing["id"],
+                    ),
                 )
             return {
                 "id": int(existing["id"]),
@@ -333,8 +464,11 @@ def add_monitor(
             """
             INSERT INTO monitors (
                 route_id, outbound_date, return_date, target_price,
-                adults, trip_type, active, travel_class, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                adults, trip_type, active, travel_class, created_at,
+                quota_mode, airline_rules_json, schedule_type, schedule_value,
+                notification_policy, quiet_hours_json, next_run_at,
+                schedule_effective_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 route_id,
@@ -344,7 +478,15 @@ def add_monitor(
                 adults,
                 trip_type,
                 travel_class,
-                datetime.now().isoformat(timespec="seconds"),
+                now_stamp,
+                quota_mode,
+                json.dumps(airline_rules or [], ensure_ascii=False),
+                schedule_type,
+                schedule_value,
+                notification_policy,
+                json.dumps(quiet_hours or {}, ensure_ascii=False),
+                next_run_at,
+                now_stamp,
             ),
         )
         return {
@@ -502,8 +644,12 @@ def get_dashboard_stats() -> Dict[str, Any]:
         notif_24h = conn.execute(
             """
             SELECT COUNT(*) AS c FROM notifications
-            WHERE created_at >= ?
+            WHERE created_at >= ? AND success=1 AND channel != 'local'
             """,
+            (cutoff_24h,),
+        ).fetchone()["c"]
+        notification_attempts_24h = conn.execute(
+            "SELECT COUNT(*) AS c FROM notifications WHERE created_at >= ?",
             (cutoff_24h,),
         ).fetchone()["c"]
         recent_history = conn.execute(
@@ -536,6 +682,7 @@ def get_dashboard_stats() -> Dict[str, Any]:
             "hit_count": int(hits),
             "avg_recent_price": avg_recent,
             "notifications_24h": int(notif_24h),
+            "notification_attempts_24h": int(notification_attempts_24h),
             "recent_history": [dict(r) for r in recent_history],
             "top_monitors": [dict(r) for r in monitor_rows],
         }
@@ -690,7 +837,10 @@ def get_api_usage_summary(
             (provider.lower(), start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")),
         ).fetchone()
     attempted = int(row["total"] or 0)
-    used = int(row["successful"] or 0)
+    # A timeout or provider error is not proof that a request was free. Treat
+    # every network attempt as quota consumption so the guard fails safe near
+    # a free-tier limit. The successful/failed split remains diagnostic.
+    used = attempted
     limit = max(0, int(monthly_limit))
     return {
         "provider": provider.lower(),
@@ -728,3 +878,550 @@ def release_api_quota_warning(provider: str, period: str, threshold: int) -> Non
             """,
             (provider.lower(), period, int(threshold)),
         )
+
+
+# ---------------------------------------------------------------------------
+# Monitor policies, run ledger, carrier quotes, and reliable notification queue
+# ---------------------------------------------------------------------------
+
+
+def get_monitor(monitor_id: int) -> Optional[Dict[str, Any]]:
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT m.*, r.origin, r.destination, r.origin_name, r.destination_name
+            FROM monitors m JOIN routes r ON r.id=m.route_id
+            WHERE m.id=?
+            """,
+            (int(monitor_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def update_monitor_policies(
+    monitor_id: int,
+    *,
+    target_price: Optional[float] = None,
+    quota_mode: Optional[str] = None,
+    airline_rules: Optional[List[Dict[str, Any]]] = None,
+    schedule_type: Optional[str] = None,
+    schedule_value: Optional[str] = None,
+    notification_policy: Optional[str] = None,
+    quiet_hours: Optional[Dict[str, Any]] = None,
+    next_run_at: Optional[str] = None,
+) -> None:
+    """Update only supplied policy fields for one monitor."""
+    allowed_modes = {"lean", "standard", "full"}
+    allowed_schedules = {"global", "fixed_times", "daily", "interval"}
+    allowed_notifications = {"always", "target_only", "price_drop", "digest"}
+    updates: List[str] = []
+    values: List[Any] = []
+    if target_price is not None:
+        price = float(target_price)
+        if price <= 0:
+            raise ValueError("target_price must be greater than zero")
+        updates.append("target_price=?")
+        values.append(price)
+    if quota_mode is not None:
+        if quota_mode not in allowed_modes:
+            raise ValueError("quota_mode must be lean, standard, or full")
+        updates.append("quota_mode=?")
+        values.append(quota_mode)
+    if airline_rules is not None:
+        updates.append("airline_rules_json=?")
+        values.append(json.dumps(airline_rules, ensure_ascii=False, separators=(",", ":")))
+    if schedule_type is not None:
+        if schedule_type not in allowed_schedules:
+            raise ValueError("unsupported schedule_type")
+        updates.append("schedule_type=?")
+        values.append(schedule_type)
+    if schedule_value is not None:
+        updates.append("schedule_value=?")
+        values.append(schedule_value.strip())
+    if notification_policy is not None:
+        if notification_policy not in allowed_notifications:
+            raise ValueError("unsupported notification_policy")
+        updates.append("notification_policy=?")
+        values.append(notification_policy)
+    if quiet_hours is not None:
+        updates.append("quiet_hours_json=?")
+        values.append(json.dumps(quiet_hours, ensure_ascii=False, separators=(",", ":")))
+    if next_run_at is not None:
+        updates.append("next_run_at=?")
+        values.append(next_run_at)
+    if not updates:
+        return
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT schedule_type, schedule_value, schedule_effective_at, created_at "
+            "FROM monitors WHERE id=?",
+            (int(monitor_id),),
+        ).fetchone()
+        if not existing:
+            raise ValueError(f"monitor {monitor_id} not found")
+        if schedule_type is not None or schedule_value is not None:
+            next_schedule_type = (
+                schedule_type
+                if schedule_type is not None
+                else str(existing["schedule_type"] or "global")
+            )
+            next_schedule_value = (
+                schedule_value.strip()
+                if schedule_value is not None
+                else str(existing["schedule_value"] or "")
+            )
+            if (
+                next_schedule_type != str(existing["schedule_type"] or "global")
+                or next_schedule_value != str(existing["schedule_value"] or "")
+            ):
+                updates.append("schedule_effective_at=?")
+                values.append(datetime.now().isoformat(timespec="seconds"))
+        values.append(int(monitor_id))
+        cur = conn.execute(f"UPDATE monitors SET {', '.join(updates)} WHERE id=?", values)
+        if cur.rowcount != 1:
+            raise ValueError(f"monitor {monitor_id} not found")
+
+
+def set_monitor_next_run(monitor_id: int, next_run_at: Optional[str], run_id: Optional[str] = None) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE monitors SET next_run_at=?, last_run_id=COALESCE(?, last_run_id) WHERE id=?",
+            (next_run_at, run_id, int(monitor_id)),
+        )
+
+
+def _check_run_lease_expired(
+    started_at: object,
+    *,
+    now: Optional[datetime] = None,
+    lease_timeout_minutes: int = 30,
+) -> bool:
+    """Return whether an unfinished run has exceeded its recovery lease."""
+    try:
+        started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return True
+    current = _outbox_time(now)
+    started_local = _outbox_time(started)
+    return current - started_local >= timedelta(
+        minutes=max(5, int(lease_timeout_minutes))
+    )
+
+
+def create_check_run(
+    monitor_id: Optional[int],
+    *,
+    trigger: str = "scheduled",
+    scheduled_slot: Optional[str] = None,
+    backfill: bool = False,
+    started_at: Optional[datetime] = None,
+    lease_timeout_minutes: int = 30,
+) -> Dict[str, Any]:
+    """Create or reclaim one idempotent scheduled run lease.
+
+    A process may die after inserting the ``running`` row.  Once that lease is
+    stale, the same row is atomically reclaimed so the unique scheduled-slot
+    constraint still prevents concurrent execution without suppressing the
+    slot forever.
+    """
+    current = started_at or datetime.now()
+    stamp = current.isoformat(timespec="seconds")
+    run_id = str(uuid.uuid4())
+    with get_db() as conn:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO check_runs (
+                id, monitor_id, trigger, scheduled_slot, status, started_at,
+                api_calls, backfill, created_at
+            ) VALUES (?, ?, ?, ?, 'running', ?, 0, ?, ?)
+            """,
+            (run_id, monitor_id, trigger, scheduled_slot, stamp, 1 if backfill else 0, stamp),
+        )
+        if cur.rowcount == 1:
+            return {"id": run_id, "created": True, "status": "running"}
+        row = conn.execute(
+            "SELECT * FROM check_runs WHERE monitor_id=? AND scheduled_slot=?",
+            (monitor_id, scheduled_slot),
+        ).fetchone()
+        if not row:
+            raise RuntimeError("run ledger conflict without an existing row")
+        if str(row["status"]) == "running" and _check_run_lease_expired(
+            row["started_at"],
+            now=current,
+            lease_timeout_minutes=lease_timeout_minutes,
+        ):
+            reclaimed = conn.execute(
+                """
+                UPDATE check_runs
+                SET trigger=?, status='running', started_at=?, completed_at=NULL,
+                    duration_ms=NULL, api_calls=0, error_stage=NULL,
+                    error_message=NULL, backfill=?, result_json=NULL, created_at=?
+                WHERE id=? AND status='running' AND started_at=?
+                """,
+                (
+                    trigger,
+                    stamp,
+                    1 if backfill else 0,
+                    stamp,
+                    row["id"],
+                    row["started_at"],
+                ),
+            )
+            if reclaimed.rowcount == 1:
+                return {
+                    "id": str(row["id"]),
+                    "created": True,
+                    "status": "running",
+                    "reclaimed": True,
+                }
+            row = conn.execute(
+                "SELECT * FROM check_runs WHERE monitor_id=? AND scheduled_slot=?",
+                (monitor_id, scheduled_slot),
+            ).fetchone()
+        result = dict(row)
+        result["created"] = False
+        return result
+
+
+def finish_check_run(
+    run_id: str,
+    *,
+    status: str,
+    api_calls: int = 0,
+    error_stage: str = "",
+    error_message: str = "",
+    result: Optional[Dict[str, Any]] = None,
+    completed_at: Optional[datetime] = None,
+) -> None:
+    if status not in {"succeeded", "partial", "failed", "skipped", "missed", "backfilled"}:
+        raise ValueError("unsupported run status")
+    completed = completed_at or datetime.now()
+    with get_db() as conn:
+        row = conn.execute("SELECT started_at FROM check_runs WHERE id=?", (run_id,)).fetchone()
+        if not row:
+            raise ValueError(f"run {run_id} not found")
+        try:
+            started = datetime.fromisoformat(str(row["started_at"]))
+            duration_ms = max(0, int((completed - started).total_seconds() * 1000))
+        except (TypeError, ValueError):
+            duration_ms = None
+        conn.execute(
+            """
+            UPDATE check_runs
+            SET status=?, completed_at=?, duration_ms=?, api_calls=?,
+                error_stage=?, error_message=?, result_json=?
+            WHERE id=?
+            """,
+            (
+                status,
+                completed.isoformat(timespec="seconds"),
+                duration_ms,
+                max(0, int(api_calls)),
+                error_stage[:80] or None,
+                error_message[:500] or None,
+                json.dumps(result or {}, ensure_ascii=False, default=str, separators=(",", ":")),
+                run_id,
+            ),
+        )
+
+
+def list_check_runs(limit: int = 100, monitor_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    with get_db() as conn:
+        sql = """
+            SELECT cr.*, r.origin, r.destination
+            FROM check_runs cr
+            LEFT JOIN monitors m ON m.id=cr.monitor_id
+            LEFT JOIN routes r ON r.id=m.route_id
+        """
+        params: List[Any] = []
+        if monitor_id is not None:
+            sql += " WHERE cr.monitor_id=?"
+            params.append(int(monitor_id))
+        sql += " ORDER BY cr.started_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def get_check_run(run_id: str) -> Optional[Dict[str, Any]]:
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM check_runs WHERE id=?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def slot_has_run(
+    monitor_id: int,
+    scheduled_slot: str,
+    *,
+    now: Optional[datetime] = None,
+    lease_timeout_minutes: int = 30,
+) -> bool:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT status, started_at FROM check_runs "
+            "WHERE monitor_id=? AND scheduled_slot=? LIMIT 1",
+            (int(monitor_id), scheduled_slot),
+        ).fetchone()
+        if not row:
+            return False
+        return not (
+            str(row["status"]) == "running"
+            and _check_run_lease_expired(
+                row["started_at"],
+                now=now,
+                lease_timeout_minutes=lease_timeout_minutes,
+            )
+        )
+
+
+def enqueue_notification(
+    *,
+    channel: str,
+    message: str,
+    dedupe_key: str,
+    monitor_id: Optional[int] = None,
+    run_id: Optional[str] = None,
+    max_attempts: int = 4,
+    next_attempt_at: Optional[datetime] = None,
+    replace_pending: bool = False,
+) -> Dict[str, Any]:
+    now = _outbox_time()
+    due = _outbox_time(next_attempt_at) if next_attempt_at is not None else now
+    with get_db() as conn:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO notification_outbox (
+                run_id, monitor_id, channel, message, status, attempt_count,
+                max_attempts, next_attempt_at, dedupe_key, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                monitor_id,
+                channel.lower(),
+                message,
+                max(1, int(max_attempts)),
+                due.isoformat(timespec="seconds"),
+                dedupe_key,
+                now.isoformat(timespec="seconds"),
+                now.isoformat(timespec="seconds"),
+            ),
+        )
+        if cur.rowcount == 0 and replace_pending:
+            conn.execute(
+                """
+                UPDATE notification_outbox
+                SET run_id=?, monitor_id=?, channel=?, message=?, status='pending',
+                    attempt_count=0, max_attempts=?, next_attempt_at=?,
+                    last_error=NULL, updated_at=?, sent_at=NULL
+                WHERE dedupe_key=? AND status IN ('pending', 'retry', 'failed')
+                """,
+                (
+                    run_id,
+                    monitor_id,
+                    channel.lower(),
+                    message,
+                    max(1, int(max_attempts)),
+                    due.isoformat(timespec="seconds"),
+                    now.isoformat(timespec="seconds"),
+                    dedupe_key,
+                ),
+            )
+        row = conn.execute(
+            "SELECT * FROM notification_outbox WHERE dedupe_key=?",
+            (dedupe_key,),
+        ).fetchone()
+        result = dict(row)
+        result["created"] = cur.rowcount == 1
+        return result
+
+
+def claim_due_notifications(
+    limit: int = 20,
+    now: Optional[datetime] = None,
+    *,
+    lease_timeout_minutes: int = 10,
+) -> List[Dict[str, Any]]:
+    """Atomically lease due rows and recover abandoned sending leases."""
+    current = _outbox_time(now)
+    stamp = current.isoformat(timespec="seconds")
+    stale_before = (
+        current - timedelta(minutes=max(1, int(lease_timeout_minutes)))
+    ).isoformat(timespec="seconds")
+    claimed: List[Dict[str, Any]] = []
+    with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE notification_outbox
+            SET status='retry', next_attempt_at=?, updated_at=?,
+                last_error=COALESCE(last_error, 'delivery lease expired')
+            WHERE status='sending' AND updated_at<=?
+              AND attempt_count < max_attempts
+            """,
+            (stamp, stamp, stale_before),
+        )
+        conn.execute(
+            """
+            UPDATE notification_outbox
+            SET status='failed', updated_at=?,
+                last_error=COALESCE(last_error, 'delivery lease expired')
+            WHERE status='sending' AND updated_at<=?
+              AND attempt_count >= max_attempts
+            """,
+            (stamp, stale_before),
+        )
+        rows = conn.execute(
+            """
+            SELECT * FROM notification_outbox
+            WHERE status IN ('pending', 'retry') AND next_attempt_at<=?
+              AND attempt_count < max_attempts
+            ORDER BY next_attempt_at ASC, id ASC LIMIT ?
+            """,
+            (stamp, max(1, min(int(limit), 100))),
+        ).fetchall()
+        for row in rows:
+            cur = conn.execute(
+                """
+                UPDATE notification_outbox
+                SET status='sending', attempt_count=attempt_count+1, updated_at=?
+                WHERE id=? AND status IN ('pending', 'retry')
+                """,
+                (stamp, int(row["id"])),
+            )
+            if cur.rowcount == 1:
+                current = conn.execute(
+                    "SELECT * FROM notification_outbox WHERE id=?", (int(row["id"]),)
+                ).fetchone()
+                claimed.append(dict(current))
+    return claimed
+
+
+def complete_outbox_delivery(
+    outbox_id: int,
+    *,
+    success: bool,
+    error: str = "",
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    current = _outbox_time(now)
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT attempt_count, max_attempts FROM notification_outbox WHERE id=?",
+            (int(outbox_id),),
+        ).fetchone()
+        if not row:
+            raise ValueError(f"outbox item {outbox_id} not found")
+        attempts = int(row["attempt_count"])
+        max_attempts = int(row["max_attempts"])
+        if success:
+            status = "sent"
+            next_attempt = current
+            sent_at = current.isoformat(timespec="seconds")
+        elif attempts >= max_attempts:
+            status = "failed"
+            next_attempt = current
+            sent_at = None
+        else:
+            status = "retry"
+            delay_minutes = min(60, 2 ** max(0, attempts - 1) * 5)
+            next_attempt = current + timedelta(minutes=delay_minutes)
+            sent_at = None
+        conn.execute(
+            """
+            UPDATE notification_outbox
+            SET status=?, next_attempt_at=?, last_error=?, updated_at=?, sent_at=?
+            WHERE id=?
+            """,
+            (
+                status,
+                next_attempt.isoformat(timespec="seconds"),
+                error[:500] or None,
+                current.isoformat(timespec="seconds"),
+                sent_at,
+                int(outbox_id),
+            ),
+        )
+        updated = conn.execute("SELECT * FROM notification_outbox WHERE id=?", (int(outbox_id),)).fetchone()
+        return dict(updated)
+
+
+def retry_outbox_delivery(outbox_id: int) -> None:
+    now = _outbox_time().isoformat(timespec="seconds")
+    with get_db() as conn:
+        cur = conn.execute(
+            """
+            UPDATE notification_outbox
+            SET status='retry', attempt_count=0, next_attempt_at=?,
+                last_error=NULL, updated_at=?, sent_at=NULL
+            WHERE id=? AND status IN ('failed', 'retry')
+            """,
+            (now, now, int(outbox_id)),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("only failed or retrying deliveries can be retried")
+
+
+def list_notification_outbox(limit: int = 100, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    with get_db() as conn:
+        sql = "SELECT * FROM notification_outbox"
+        params: List[Any] = []
+        if status:
+            sql += " WHERE status=?"
+            params.append(status)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def save_carrier_quotes(
+    *,
+    route_id: int,
+    quotes: List[Dict[str, Any]],
+    monitor_id: Optional[int] = None,
+    run_id: Optional[str] = None,
+    recorded_at: Optional[datetime] = None,
+) -> int:
+    stamp = (recorded_at or datetime.now()).isoformat(timespec="seconds")
+    inserted = 0
+    with get_db() as conn:
+        for quote in quotes:
+            price = quote.get("total_price", quote.get("price"))
+            if price is None:
+                continue
+            conn.execute(
+                """
+                INSERT INTO carrier_quotes (
+                    run_id, monitor_id, route_id, carrier_code, carrier_name,
+                    total_price, currency, outbound_json, return_json, stops, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    monitor_id,
+                    int(route_id),
+                    str(quote.get("carrier_code") or "")[:12],
+                    str(quote.get("carrier_name") or quote.get("airline") or "")[:120],
+                    float(price),
+                    str(quote.get("currency") or "TWD")[:8],
+                    json.dumps(quote.get("outbound") or {}, ensure_ascii=False, default=str),
+                    json.dumps(quote.get("return") or quote.get("return_flight") or {}, ensure_ascii=False, default=str),
+                    max(0, int(quote.get("stops") or 0)),
+                    stamp,
+                ),
+            )
+            inserted += 1
+    return inserted
+
+
+def list_carrier_quotes(monitor_id: int, limit: int = 200) -> List[Dict[str, Any]]:
+    with get_db() as conn:
+        return [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM carrier_quotes
+                WHERE monitor_id=? ORDER BY recorded_at DESC LIMIT ?
+                """,
+                (int(monitor_id), max(1, min(int(limit), 1000))),
+            ).fetchall()
+        ]

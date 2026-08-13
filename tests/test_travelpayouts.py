@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from src.travelpayouts import get_market_reference
+from src.travelpayouts import TravelpayoutsError, get_low_fare_calendar, get_market_reference
 
 
 class TravelpayoutsTests(unittest.TestCase):
@@ -42,6 +42,43 @@ class TravelpayoutsTests(unittest.TestCase):
         self.assertEqual(result["match"], "monthly_low")
         self.assertEqual(result["departure_date"], "2026-09-03")
         self.assertEqual(result["price"], 9000)
+
+    @patch("src.travelpayouts.requests.get")
+    def test_low_fare_calendar_marks_cached_non_bookable_bands(self, get_mock):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "success": True,
+            "data": {
+                "2026-09-01": {"price": 8000, "airline": "JX", "transfers": 0},
+                "2026-09-02": {"price": 10000, "airline": "BR", "transfers": 0},
+                "2026-09-03": {"price": 14000, "airline": "CI", "transfers": 1},
+                "2026-10-01": {"price": 1000},
+            },
+        }
+        get_mock.return_value = response
+        with patch("src.travelpayouts.TRAVELPAYOUTS_TOKEN", "secret-token"):
+            result = get_low_fare_calendar("TPE", "KIX", "2026-09")
+        self.assertTrue(result["cached"])
+        self.assertFalse(result["bookable"])
+        self.assertEqual(result["observations"], 3)
+        self.assertEqual([day["price_band"] for day in result["days"]], ["low", "mid", "high"])
+        self.assertEqual(result["verify_provider"], "serpapi")
+
+    @patch("src.travelpayouts.requests.get")
+    def test_malformed_data_shape_raises_adapter_error(self, get_mock):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"success": True, "data": []}
+        get_mock.return_value = response
+        with patch("src.travelpayouts.TRAVELPAYOUTS_TOKEN", "secret-token"):
+            with self.assertRaises(TravelpayoutsError):
+                get_low_fare_calendar("TPE", "KIX", "2026-09")
+
+    def test_non_alpha_iata_is_rejected_before_network(self):
+        with patch("src.travelpayouts.TRAVELPAYOUTS_TOKEN", "secret-token"):
+            with self.assertRaises(TravelpayoutsError):
+                get_market_reference("1@#", "KIX", "2026-09-01")
 
 
 if __name__ == "__main__":

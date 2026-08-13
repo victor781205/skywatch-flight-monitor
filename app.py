@@ -1,19 +1,20 @@
-"""
-即時機票監控系統 - 商務企業級儀表板
-啟動：streamlit run app.py
+"""SkyWatch 航班價格監控的 Streamlit 操作介面。
+
+執行：streamlit run app.py
 """
 from __future__ import annotations
 
-import html
 import json
+import os
 import sys
-from datetime import date, datetime, timedelta
+import tempfile
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parent
@@ -21,1466 +22,1827 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src import database as db
-from src.api_usage import estimate_monthly_primary_searches, quota_summaries
-from src.airports import get_label, options_for_select
+from src import ui
+from src.airports import airport_data_status, options_for_select
+from src.api_usage import quota_summaries, scheduled_runs_per_day
+from src.backup import (
+    BackupError,
+    BackupValidationError,
+    create_full_backup,
+    export_monitors,
+    import_monitors,
+    inspect_backup,
+    preview_monitor_import,
+    restore_full_backup,
+)
 from src.config import (
     API_USAGE_WARNING_PERCENT,
-    ALWAYS_NOTIFY,
     APP_VERSION,
-    MONITOR_FETCH_DETAILS_ON_HIT,
-    NOTIFY_COOLDOWN_HOURS,
+    DB_PATH,
+    MISSED_RUN_LOOKBACK_HOURS,
+    SCHEDULER_TICK_MINUTES,
     SERPAPI_API_KEY,
+    SERPAPI_MONTHLY_LIMIT,
+    TELEGRAM_ALLOWED_CHAT_IDS,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_COMMANDS_ENABLED,
 )
 from src.flight_api import FlightAPIError, format_flight_summary
 from src.monitor import check_all_monitors, check_one_monitor, search_and_save
-from src.notifier import configured_channels, send_all
-from src.travelpayouts import (
-    TravelpayoutsError,
-    configured as travelpayouts_ready,
-    get_market_reference,
+from src.notifier import configured_channels, process_notification_outbox
+from src.policies import (
+    AirlineCode,
+    AirlineRuleSet,
+    NotificationPolicy,
+    QuotaPolicy,
+    SchedulePolicy,
+    normalize_airline,
 )
+from src.travelpayouts import TravelpayoutsError, configured as travelpayouts_ready
+from src.travelpayouts import get_low_fare_calendar
+
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
+CLASS_NAMES = {1: "經濟艙", 2: "豪華經濟艙", 3: "商務艙", 4: "頭等艙"}
+CLASS_CODES = {label: code for code, label in CLASS_NAMES.items()}
+QUOTA_LABELS = {"lean": "精簡", "standard": "標準", "full": "完整"}
+SCHEDULE_LABELS = {
+    "global": "沿用系統排程",
+    "fixed_times": "每日多個固定時間",
+    "daily": "每日固定時間",
+    "interval": "固定間隔",
+}
+NOTIFICATION_LABELS = {
+    "always": "每次查價皆回報",
+    "target_only": "僅達目標價",
+    "price_drop": "僅價格下降",
+    "digest": "彙整通知",
+}
+AIRLINES = (("EVA", "長榮航空"), ("CI", "中華航空"), ("JX", "星宇航空"))
+RUN_STATUS_LABELS = {
+    "running": "執行中",
+    "succeeded": "成功",
+    "partial": "部分完成",
+    "failed": "失敗",
+    "skipped": "已略過",
+    "missed": "偵測到漏跑",
+    "backfilled": "已補跑",
+    "recovered": "已復原",
+}
+OUTBOX_STATUS_LABELS = {
+    "pending": "等待外送",
+    "retry": "等待重試",
+    "sending": "外送中",
+    "sent": "已送達",
+    "failed": "外送失敗",
+}
+RUN_TRIGGER_LABELS = {
+    "manual": "手動檢查",
+    "scheduled": "排程執行",
+    "schedule": "排程執行",
+    "backfill": "自動補跑",
+    "telegram": "Telegram 指令",
+    "global": "系統排程",
+}
+
 
 st.set_page_config(
-    page_title="SkyWatch · 企業級機票監控",
+    page_title="SkyWatch 航班價格監控",
     page_icon="✈️",
     layout="wide",
-    initial_sidebar_state="auto",
+    initial_sidebar_state="expanded",
 )
 
 db.init_db()
-
 try:
-    with open("style.css", "r", encoding="utf-8") as f:
-        st.html(f"<style>\n{f.read()}\n</style>")
-except FileNotFoundError:
+    st.html(f"<style>\n{(ROOT / 'style.css').read_text(encoding='utf-8')}\n</style>")
+except (FileNotFoundError, OSError, UnicodeError):
     pass
 
 
-def _safe(value: object) -> str:
-    """Escape dynamic values before rendering custom HTML."""
-    return html.escape(str(value or ""), quote=True)
+def _now() -> datetime:
+    return datetime.now(TAIPEI_TZ)
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=TAIPEI_TZ) if parsed.tzinfo is None else parsed.astimezone(TAIPEI_TZ)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_datetime(value: Any, fallback: str = "尚無紀錄") -> str:
+    parsed = value if isinstance(value, datetime) else _parse_datetime(value)
+    return parsed.strftime("%Y/%m/%d %H:%M") if parsed else fallback
+
+
+def _json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(str(value or "{}"))
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _json_list(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    try:
+        parsed = json.loads(str(value or "[]"))
+        return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+
+
+def _currency(value: Any) -> str:
+    if value is None or value == "":
+        return "—"
+    try:
+        return f"NT$ {float(value):,.0f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _localized_status(value: Any, labels: dict[str, str]) -> str:
+    raw = str(value or "").strip().lower()
+    return labels.get(raw, raw or "未知")
+
+
+def _clock_value(value: Any, fallback: time) -> time:
+    try:
+        return time.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return fallback
 
 
 def flight_api_ready() -> bool:
-    return bool(SERPAPI_API_KEY)
+    return bool(SERPAPI_API_KEY.strip())
 
 
-def get_scheduler_health() -> dict:
-    """Read the independent scheduler heartbeat without starting another timer."""
-    log_path = ROOT / "data" / "scheduler.log"
+def get_scheduler_health() -> dict[str, Any]:
+    """從排程器 heartbeat 取得動態健康狀態，不在 UI 內另開排程器。"""
     status_path = ROOT / "data" / "scheduler_status.json"
-    now = datetime.now(TAIPEI_TZ)
-    next_candidates = [
-        now.replace(hour=hour, minute=0, second=0, microsecond=0) + timedelta(days=day_offset)
-        for day_offset in (0, 1)
-        for hour in (0, 12)
-        if now.replace(hour=hour, minute=0, second=0, microsecond=0) + timedelta(days=day_offset) > now
-    ]
-    result = {
+    result: dict[str, Any] = {
         "healthy": False,
-        "label": "尚無執行紀錄",
-        "last_run": None,
-        "schedule": "每日 00:00 / 12:00",
-        "next_run": min(next_candidates) if next_candidates else None,
         "state": "unknown",
-        "last_error": None,
+        "supervisor_state": "unknown",
+        "label": "尚未收到排程器狀態",
+        "last_run": None,
+        "next_run": None,
+        "updated_at": None,
+        "last_error": "",
+        "recovered_count": 0,
+        "retry_count": 0,
+        "schedule": "依每筆監控策略",
+    }
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return result
+    except (FileNotFoundError, OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return result
+
+    updated = _parse_datetime(payload.get("updated_at"))
+    last_run = _parse_datetime(payload.get("last_completed_at"))
+    next_run = _parse_datetime(payload.get("next_run_at"))
+    fresh_for = max(15 * 60, int(SCHEDULER_TICK_MINUTES) * 180)
+    fresh = bool(updated and (_now() - updated).total_seconds() <= fresh_for)
+    state = str(payload.get("state") or "waiting").lower()
+    supervisor = str(payload.get("supervisor_state") or "unknown").lower()
+    healthy = fresh and state != "error" and supervisor != "error"
+    label = "運作正常" if healthy else "狀態過期或異常"
+    result.update(
+        healthy=healthy,
+        state=state,
+        supervisor_state=supervisor,
+        label=label,
+        last_run=last_run,
+        next_run=next_run,
+        updated_at=updated,
+        last_error=str(payload.get("last_error") or ""),
+        recovered_count=int(payload.get("recovered_count") or 0),
+        retry_count=int(payload.get("retry_count") or 0),
+        schedule=str(payload.get("schedule") or result["schedule"]),
+    )
+    return result
+
+
+def _global_schedule_policy() -> SchedulePolicy:
+    raw_interval = os.getenv("CHECK_INTERVAL_MINUTES", "").strip()
+    if raw_interval:
+        try:
+            return SchedulePolicy.from_dict({"mode": "interval", "interval_minutes": max(5, int(raw_interval))})
+        except ValueError:
+            pass
+    raw_hours = os.getenv("SCHEDULE_HOURS", "0,12")
+    clocks: list[str] = []
+    for item in raw_hours.split(","):
+        try:
+            hour = int(item.strip())
+            if 0 <= hour <= 23:
+                clocks.append(f"{hour:02d}:00")
+        except ValueError:
+            continue
+    return SchedulePolicy.from_dict({"mode": "fixed_times", "fixed_times": clocks or ["00:00", "12:00"]})
+
+
+def _schedule_policy(schedule_type: str, schedule_value: str) -> SchedulePolicy:
+    if schedule_type == "global":
+        return _global_schedule_policy()
+    if schedule_type == "fixed_times":
+        return SchedulePolicy.from_dict({"mode": schedule_type, "fixed_times": schedule_value})
+    if schedule_type == "daily":
+        return SchedulePolicy.from_dict({"mode": schedule_type, "daily_time": schedule_value})
+    return SchedulePolicy.from_dict({"mode": "interval", "interval_minutes": int(schedule_value)})
+
+
+def _monitor_runs_per_day(monitor: dict[str, Any]) -> float:
+    try:
+        return _schedule_policy(
+            str(monitor.get("schedule_type") or "global"),
+            str(monitor.get("schedule_value") or ""),
+        ).runs_per_day
+    except (TypeError, ValueError):
+        return scheduled_runs_per_day()
+
+
+def _schedule_label(schedule_type: Any, schedule_value: Any) -> str:
+    kind = str(schedule_type or "global")
+    value = str(schedule_value or "")
+    if kind == "global":
+        return SCHEDULE_LABELS[kind]
+    if kind == "interval":
+        return f"每 {value or '?'} 分鐘"
+    return f"{SCHEDULE_LABELS.get(kind, kind)} · {value}"
+
+
+def _page_header(title: str, subtitle: str, *, eyebrow: str, badges: list[Any] | None = None) -> None:
+    st.html(ui.page_header(title, subtitle, eyebrow=eyebrow, badges=badges or [], meta=f"v{APP_VERSION}"))
+
+
+def _metric_row(cards: list[dict[str, Any]]) -> None:
+    columns = st.columns(len(cards))
+    for column, card in zip(columns, cards):
+        with column:
+            st.html(ui.metric_card(**card))
+
+
+def _airport_input(label: str, key: str, default: str) -> str:
+    query = st.text_input(f"搜尋{label}", key=f"{key}_query", placeholder="城市、機場或 IATA")
+    options = options_for_select(query, limit=80)
+    if not options:
+        st.warning("找不到符合的機場")
+        return default
+    if airport_data_status() == "fallback" and not st.session_state.get("airport_fallback_notice"):
+        st.info("目前離線使用內建熱門機場清單；網路恢復後重啟即可載入全球機場資料。")
+        st.session_state["airport_fallback_notice"] = True
+    labels = list(options)
+    default_index = next((i for i, item in enumerate(labels) if options[item] == default), 0)
+    selected = st.selectbox(label, labels, index=default_index, key=f"{key}_select")
+    return options[selected]
+
+
+def _schedule_fields(prefix: str, existing_type: str = "global", existing_value: str = "") -> tuple[str, str, SchedulePolicy]:
+    types = list(SCHEDULE_LABELS)
+    selected = st.selectbox(
+        "執行排程",
+        types,
+        index=types.index(existing_type) if existing_type in types else 0,
+        format_func=lambda item: SCHEDULE_LABELS[item],
+        key=f"{prefix}_schedule_type",
+    )
+    value = ""
+    if selected == "fixed_times":
+        value = st.text_input(
+            "每日執行時間",
+            value=existing_value if existing_type == selected and existing_value else "08:00,20:00",
+            help="以逗號分隔 24 小時制時間，例如 08:00,20:00。",
+            key=f"{prefix}_fixed_times",
+        ).strip()
+    elif selected == "daily":
+        raw = existing_value if existing_type == selected and existing_value else "08:00"
+        try:
+            initial = time.fromisoformat(raw)
+        except ValueError:
+            initial = time(8, 0)
+        value = st.time_input("每日執行時間", value=initial, key=f"{prefix}_daily_time").strftime("%H:%M")
+    elif selected == "interval":
+        try:
+            initial_minutes = max(5, int(existing_value)) if existing_type == selected else 720
+        except (TypeError, ValueError):
+            initial_minutes = 720
+        value = str(
+            st.number_input(
+                "執行間隔（分鐘）",
+                min_value=5,
+                max_value=10080,
+                value=initial_minutes,
+                step=5,
+                key=f"{prefix}_interval",
+            )
+        )
+    try:
+        policy = _schedule_policy(selected, value)
+        st.caption(f"預估每日 {policy.runs_per_day:.1f} 次；下次執行 {_format_datetime(policy.next_run(_now()))}")
+    except (TypeError, ValueError) as exc:
+        st.error(f"排程格式尚未完成：{exc}")
+        policy = _global_schedule_policy()
+    return selected, value, policy
+
+
+def _notification_fields(
+    prefix: str,
+    existing_strategy: str = "always",
+    existing_quiet: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, str]]:
+    strategies = list(NOTIFICATION_LABELS)
+    strategy = st.selectbox(
+        "通知策略",
+        strategies,
+        index=strategies.index(existing_strategy) if existing_strategy in strategies else 0,
+        format_func=lambda item: NOTIFICATION_LABELS[item],
+        key=f"{prefix}_notification",
+    )
+    quiet = existing_quiet or {}
+    enabled = st.checkbox("啟用安靜時段", value=bool(quiet), key=f"{prefix}_quiet_enabled")
+    quiet_hours: dict[str, str] = {}
+    if enabled:
+        left, right = st.columns(2)
+        try:
+            start_value = time.fromisoformat(str(quiet.get("start") or "23:00"))
+            end_value = time.fromisoformat(str(quiet.get("end") or "07:00"))
+        except ValueError:
+            start_value, end_value = time(23, 0), time(7, 0)
+        start = left.time_input("安靜開始", value=start_value, key=f"{prefix}_quiet_start")
+        end = right.time_input("安靜結束", value=end_value, key=f"{prefix}_quiet_end")
+        quiet_hours = {"start": start.strftime("%H:%M"), "end": end.strftime("%H:%M")}
+    NotificationPolicy.from_dict({"strategy": strategy, "quiet_hours": quiet_hours or None})
+    return strategy, quiet_hours
+
+
+def _airline_rule_fields(
+    prefix: str,
+    existing_rules: list[dict[str, Any]] | None = None,
+    *,
+    round_trip: bool = True,
+) -> list[dict[str, Any]]:
+    existing = {str(item.get("airline")): item for item in (existing_rules or [])}
+    rules: list[dict[str, Any]] = []
+    st.caption("可為三家國籍航空設定不同目標價、轉機上限與出發時段；未啟用者仍可出現在一般最低價結果。")
+    for code, name in AIRLINES:
+        saved = existing.get(code, {})
+        with st.expander(f"{name} · {code}", expanded=bool(saved)):
+            enabled = st.checkbox("啟用專屬條件", value=bool(saved), key=f"{prefix}_{code}_enabled")
+            if not enabled:
+                continue
+            target = st.number_input(
+                "航空公司目標價",
+                min_value=100.0,
+                max_value=1_000_000.0,
+                value=float(saved.get("target_price") or 10000),
+                step=100.0,
+                key=f"{prefix}_{code}_target",
+            )
+            c1, c2, c3 = st.columns(3)
+            direct = c1.checkbox(
+                "僅限直飛",
+                value=bool(saved.get("direct_only", False)),
+                key=f"{prefix}_{code}_direct",
+            )
+            max_stops = int(
+                c2.number_input(
+                    "最多轉機",
+                    min_value=0,
+                    max_value=3,
+                    value=int(saved.get("max_stops") or 0),
+                    disabled=direct,
+                    key=f"{prefix}_{code}_stops",
+                )
+            )
+            basis = c3.selectbox(
+                "價格判定",
+                ["total", "per_person"],
+                index=1 if saved.get("price_basis") == "per_person" else 0,
+                format_func=lambda item: "每人價格" if item == "per_person" else "行程總價",
+                key=f"{prefix}_{code}_basis",
+            )
+            window = saved.get("outbound_window") or {}
+            has_outbound_window = st.checkbox(
+                "限制去程出發時段",
+                value=bool(window),
+                key=f"{prefix}_{code}_outbound_window_enabled",
+            )
+            outbound_window = None
+            if has_outbound_window:
+                wc1, wc2 = st.columns(2)
+                out_start = wc1.time_input(
+                    "去程最早",
+                    value=_clock_value(window.get("start"), time(6, 0)),
+                    key=f"{prefix}_{code}_out_start",
+                )
+                out_end = wc2.time_input(
+                    "去程最晚",
+                    value=_clock_value(window.get("end"), time(22, 0)),
+                    key=f"{prefix}_{code}_out_end",
+                )
+                outbound_window = {"start": out_start.strftime("%H:%M"), "end": out_end.strftime("%H:%M")}
+            return_window = None
+            if round_trip:
+                saved_return = saved.get("return_window") or {}
+                has_return_window = st.checkbox(
+                    "限制回程出發時段",
+                    value=bool(saved_return),
+                    key=f"{prefix}_{code}_return_window_enabled",
+                )
+                if has_return_window:
+                    rc1, rc2 = st.columns(2)
+                    ret_start = rc1.time_input(
+                        "回程最早",
+                        value=_clock_value(saved_return.get("start"), time(6, 0)),
+                        key=f"{prefix}_{code}_ret_start",
+                    )
+                    ret_end = rc2.time_input(
+                        "回程最晚",
+                        value=_clock_value(saved_return.get("end"), time(22, 0)),
+                        key=f"{prefix}_{code}_ret_end",
+                    )
+                    return_window = {"start": ret_start.strftime("%H:%M"), "end": ret_end.strftime("%H:%M")}
+            rules.append(
+                {
+                    "airline": code,
+                    "target_price": float(target),
+                    "direct_only": direct,
+                    "max_stops": 0 if direct else max_stops,
+                    "outbound_window": outbound_window,
+                    "return_window": return_window,
+                    "price_basis": basis,
+                    "require_same_airline_roundtrip": round_trip,
+                }
+            )
+    return AirlineRuleSet.from_dict(rules).to_dict()["rules"]
+
+
+def _quota_forecast(mode: str, runs_per_day: float, monitor_count: int = 1) -> dict[str, Any]:
+    usage = db.get_api_usage_summary("serpapi", SERPAPI_MONTHLY_LIMIT)
+    return QuotaPolicy(mode=mode, monthly_limit=SERPAPI_MONTHLY_LIMIT).forecast(
+        runs_per_day=runs_per_day,
+        monitor_count=monitor_count,
+        used_requests=int(usage["attempted"]),
+    ).to_dict()
+
+
+def _flight_leg_payload(
+    flight: dict[str, Any],
+    *,
+    flight_date: Any,
+    origin: str,
+    destination: str,
+) -> dict[str, Any]:
+    return {
+        "date": flight_date or "",
+        "airline": flight.get("airline") or "航空公司待確認",
+        "flight_number": flight.get("flight_number") or "",
+        "departure_time": flight.get("departure_time") or "--:--",
+        "arrival_time": flight.get("arrival_time") or "--:--",
+        "origin": flight.get("departure") or origin,
+        "destination": flight.get("arrival") or destination,
+        "duration": flight.get("duration") or "",
+        "stops": flight.get("stops"),
     }
 
-    try:
-        status = json.loads(status_path.read_text(encoding="utf-8"))
-        completed_raw = status.get("last_completed_at")
-        if completed_raw:
-            last_run = datetime.fromisoformat(completed_raw)
-            if last_run.tzinfo is None:
-                last_run = last_run.replace(tzinfo=TAIPEI_TZ)
-            age_hours = (now - last_run.astimezone(TAIPEI_TZ)).total_seconds() / 3600
-            result.update(
-                healthy=age_hours <= 14 and status.get("state") != "error",
-                label=f"最近完成 {last_run.strftime('%m/%d %H:%M')}",
-                last_run=last_run,
-                schedule=status.get("schedule") or result["schedule"],
-                state=status.get("state") or "unknown",
-                last_error=status.get("last_error"),
-            )
-            return result
-    except (FileNotFoundError, OSError, UnicodeError, ValueError, TypeError):
-        pass
 
-    if not log_path.exists():
-        return result
-    try:
-        lines = log_path.read_text(encoding="utf-8").splitlines()
-        completed = next((line for line in reversed(lines) if "查價完成" in line), "")
-        if completed.startswith("[") and "]" in completed:
-            stamp = completed[1:completed.index("]")]
-            last_run = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
-            last_run = last_run.replace(tzinfo=TAIPEI_TZ)
-            age_hours = (now - last_run).total_seconds() / 3600
-            result.update(
-                healthy=age_hours <= 14,
-                label=f"最近完成 {last_run.strftime('%m/%d %H:%M')}",
-                last_run=last_run,
-                state="healthy" if age_hours <= 14 else "stale",
-            )
-    except (OSError, UnicodeError, ValueError):
-        result["label"] = "排程紀錄無法讀取"
-    return result
-
-
-def get_notification_health() -> dict:
-    latest = next(iter(db.list_notifications(1)), None)
-    result = {"latest": latest, "sent_today": False, "label": "尚無通知紀錄"}
-    if not latest:
-        return result
-    try:
-        sent_at = datetime.fromisoformat(latest["created_at"])
-        if sent_at.tzinfo is None:
-            sent_at = sent_at.replace(tzinfo=TAIPEI_TZ)
-        result.update(
-            sent_today=bool(latest.get("success")) and sent_at.date() == datetime.now(TAIPEI_TZ).date(),
-            label=f"{sent_at.strftime('%m/%d %H:%M')} · {latest.get('channel', 'local')}",
-            sent_at=sent_at,
-        )
-    except (KeyError, TypeError, ValueError):
-        result["label"] = "通知紀錄格式異常"
-    return result
-
-def inject_hero(
-    title: str,
-    subtitle: str,
-    badges: list[str] | None = None,
-    *,
-    kicker: str = "SKYWATCH ENTERPRISE",
-):
-    badges_html = ""
-    if badges:
-        badges_html = (
-            '<div class="badge-row">'
-            + "".join(f'<span class="badge">{b}</span>' for b in badges)
-            + "</div>"
-        )
-    st.html(
-        (
-            f'<div class="hero">'
-            f'<div class="hero-kicker">{kicker}</div>'
-            f'<div class="hero-title">{title}</div>'
-            f'<p class="hero-sub">{subtitle}</p>'
-            f"{badges_html}"
-            f"</div>"
-        ))
-
-
-def inject_cmd_bar(
-    *,
-    api_ok: bool,
-    channels: list[str],
-    cooldown_h: float,
-    extra: str = "",
-):
-    api_txt = "ONLINE" if api_ok else "OFFLINE"
-    ch_txt = " / ".join(channels) if channels else "未設定"
-    extra_html = f'<span class="pill">{extra}</span>' if extra else ""
-    st.html(
-        (
-            f'<div class="cmd-bar">'
-            f'<div class="left">'
-            f'<span class="pill">API <strong>{api_txt}</strong></span>'
-            f'<span class="pill">通知 <strong>{ch_txt}</strong></span>'
-            f'<span class="pill">排程 <strong>必送</strong></span>'
-            f"{extra_html}"
-            f"</div>"
-            f'<div class="right">多來源票價 API · 免費額度優先排程</div>'
-            f"</div>"
-        ))
-
-
-def render_kpi_row(items: list[dict]):
-    """items: label/value/sub/trend/trend_cls/accent
-
-    使用 st.columns 逐卡渲染，避免 Streamlit markdown 因多行/空行把 HTML 當純文字。
-    """
-    if not items:
-        return
-    cols = st.columns(len(items))
-    for col, it in zip(cols, items):
-        accent = it.get("accent") or "accent-navy"
-        trend = it.get("trend")
-        trend_cls = it.get("trend_cls") or ""
-        trend_html = (
-            f'<div class="kpi-trend {trend_cls}">{trend}</div>' if trend else ""
-        )
-        # 單行 HTML，避免空白行導致 markdown 中斷
-        html = (
-            f'<div class="kpi-card {accent}">'
-            f'<div class="kpi-label">{it.get("label", "")}</div>'
-            f'<div class="kpi-value">{it.get("value", "—")}</div>'
-            f'<div class="kpi-sub">{it.get("sub", "")}</div>'
-            f"{trend_html}"
-            f"</div>"
-        )
-        with col:
-            st.html(html)
-
-
-def render_flight_card(f: dict, rank: int = 0):
-    stops = int(f.get("stops") or 0)
-    stop_text = "直飛" if stops == 0 else f"{stops} 次轉機"
-    stop_chip = "green" if stops == 0 else "amber"
-    best_cls = " best" if rank == 0 else ""
-    price = f.get("price")
-    price_str = f"NT$ {price:,.0f}" if price is not None else "—"
-    dep = (f.get("departure_time") or "").replace("T", " ")
-    arr = (f.get("arrival_time") or "").replace("T", " ")
-    # 只顯示時間部分若有日期
-    dep_show = dep[-5:] if len(dep) >= 16 else dep
-    arr_show = arr[-5:] if len(arr) >= 16 else arr
-    dep_full = dep if len(dep) > 5 else ""
-    arr_full = arr if len(arr) > 5 else ""
-
-    price_sub = "最低價" if rank == 0 else f"選項 #{rank+1}"
-    dep_city = f"{f.get('departure') or ''} {dep_full[:10] if dep_full else ''}".strip()
-    arr_city = f"{f.get('arrival') or ''} {arr_full[:10] if arr_full else ''}".strip()
-    airline_html = _safe(f.get("airline") or "未知航空")
-    flight_number_html = _safe(f.get("flight_number") or "—")
-    duration_html = _safe(f.get("duration") or "—")
-    dep_city_html = _safe(dep_city)
-    arr_city_html = _safe(arr_city)
-
-    # 碳排放 chip
-    carbon = f.get("carbon_emissions")
-    carbon_html = ""
-    if carbon is not None:
-        carbon_kg = carbon / 1000 if carbon > 500 else carbon
-        carbon_html = f'<span class="chip carbon">🌿 {carbon_kg:.0f} kg CO₂</span>'
-
-    st.html(
-        (
-            f'<div class="flight-card{best_cls}">'
-            f'<div class="fc-top">'
-            f"<div>"
-            f'<div class="fc-airline">{airline_html}</div>'
-            f'<div class="fc-meta">'
-            f'<span class="chip">{flight_number_html}</span>'
-            f'<span class="chip {stop_chip}">{stop_text}</span>'
-            f'<span class="chip">{duration_html}</span>'
-            f'{carbon_html}'
-            f"</div></div>"
-            f"<div>"
-            f'<div class="fc-price">{price_str}</div>'
-            f'<div class="fc-price-sub">{price_sub}</div>'
-            f"</div></div>"
-            f'<div class="fc-timeline">'
-            f'<div style="text-align:left;min-width:70px">'
-            f'<div class="fc-time">{dep_show or "—"}</div>'
-            f'<div class="fc-city">{dep_city_html}</div>'
-            f'</div>'
-            f'<div class="fc-line"><span class="fc-stops">{stop_text}</span></div>'
-            f'<div style="text-align:right;min-width:70px">'
-            f'<div class="fc-time">{arr_show or "—"}</div>'
-            f'<div class="fc-city">{arr_city_html}</div>'
-            f'</div>'
-            f'</div></div>'
-        ))
-
-
-def pick_airport(label: str, key: str, default_iata: str = "TPE") -> str:
-    """
-    選擇機場的通用組件。回傳 IATA 代碼。
-
-    功能：
-    1. 文字搜尋框，支援城市/機場名/IATA 碼
-    2. 若輸入 3 碼 IATA，提供快捷確認
-    3. 下拉選單動態篩選
-    """
-    # 載入初始選項
-    opts: dict[str, str] = {}
-    try:
-        opts = dict(options_for_select("", limit=80))
-    except Exception:
-        pass
-
-    # 確保預設的 IATA 存在於選項中
-    default_label = (get_label(default_iata) or default_iata)
-    if default_label not in opts:
-        opts[default_label] = default_iata
-
-    labels = list(opts.keys())
-
-    # 搜尋框
-    q = st.text_input(
-        f"搜尋{label}",
-        value="",
-        key=f"{key}_q",
-        placeholder="城市、機場名或 IATA（如 東京 / NRT）",
+def _render_flight_pair(result: dict[str, Any], flight: dict[str, Any], *, best: bool = False) -> bool:
+    returning = flight.get("return_flight") or flight.get("returning")
+    if not isinstance(returning, dict):
+        return False
+    outbound = _flight_leg_payload(
+        flight,
+        flight_date=result.get("outbound_date"),
+        origin=str(result.get("origin") or "---"),
+        destination=str(result.get("destination") or "---"),
     )
-
-    # 3 碼 IATA 快捷
-    manual = (q or "").strip().upper()
-    if len(manual) == 3 and manual.isalpha():
-        st.caption(f"IATA `{manual}`")
-        if st.checkbox(f"直接使用 {manual}", value=True, key=f"{key}_manual"):
-            return manual
-
-    # 根據搜尋文字動態更新選項
-    if q:
-        try:
-            fresh = options_for_select(q, limit=100)
-            if fresh:
-                opts = dict(fresh)
-                labels = list(opts.keys())
-        except Exception:
-            pass
-
-    # 確保選項不為空
-    if not labels:
-        labels = [default_label]
-        opts = {default_label: default_iata}
-
-    default_index = labels.index(default_label) if default_label in labels else 0
-    chosen = st.selectbox(label, options=labels, index=default_index, key=f"{key}_sel")
-    return opts.get(chosen, default_iata)
-
-
-def sidebar():
-    with st.sidebar:
-        st.html(
-            (
-                '<div class="sb-brand">'
-                '<div class="sb-logo">✈ Sky<span>Watch</span></div>'
-                '<div class="sb-tag">航班價格監控中心</div>'
-                "</div>"
-            ))
-        page = st.radio(
-            "導覽",
-            ["儀表板", "搜尋航班", "價格歷史", "監控管理", "通知與系統設定", "使用說明"],
-        )
-        st.markdown("---")
-        channels = configured_channels()
-        api_ok = flight_api_ready()
-        api_label = "SerpAPI 已連線"
-        api_row = (
-            f'<div class="sb-status-row"><span class="status-dot dot-on"></span>{api_label}</div>'
-            if api_ok
-            else '<div class="sb-status-row"><span class="status-dot dot-off"></span>缺少票價 API</div>'
-        )
-        ch_rows = "".join(
-            f'<div class="sb-status-row"><span class="status-dot dot-on"></span>{ch}</div>'
-            for ch in channels
-        ) or '<div class="sb-status-row"><span class="status-dot dot-off"></span>尚未設定通知</div>'
-        st.html(
-            (
-                f'<div class="sb-status-card">'
-                f'<div class="sb-status-title">系統狀態</div>'
-                f"{api_row}"
-                f"{ch_rows}"
-                f"</div>"
-            ))
-        st.caption("固定回報 · 每日 00:00 / 12:00")
-        st.caption(f"全球機場 · 約 8,800 個 IATA")
-        st.markdown("---")
-        st.caption(f"SkyWatch v{APP_VERSION} · {datetime.now().strftime('%Y-%m-%d')}")
-
-        scheduler_health = get_scheduler_health()
-        dot = "dot-on" if scheduler_health["healthy"] else "dot-warn"
-        st.html(
-            f'<div class="sb-status-card">'
-            f'<div class="sb-status-title">背景排程</div>'
-            f'<div class="sb-status-row"><span class="status-dot {dot}"></span>'
-            f'{_safe(scheduler_health["label"])}</div>'
-            f'<div class="sb-status-meta">{_safe(scheduler_health["schedule"])}</div>'
-            f'</div>')
-
-    return page
-
-
-def _duration_minutes(duration: str | None) -> int:
-    """將 '5h 30m' / '5h' / '90m' 轉成分鐘，供排序用。"""
-    if not duration:
-        return 10**9
-    text = str(duration).lower().replace(" ", "")
-    hours = mins = 0
-    if "h" in text:
-        try:
-            hours = int(text.split("h")[0] or 0)
-            rest = text.split("h", 1)[1]
-            if rest.endswith("m"):
-                mins = int(rest[:-1] or 0)
-        except ValueError:
-            return 10**9
-    elif text.endswith("m"):
-        try:
-            mins = int(text[:-1] or 0)
-        except ValueError:
-            return 10**9
-    else:
-        return 10**9
-    return hours * 60 + mins
-
-
-def _filter_sort_flights(
-    flights: list[dict],
-    *,
-    direct_only: bool,
-    max_stops: int,
-    sort_by: str,
-) -> list[dict]:
-    items = list(flights or [])
-    if direct_only:
-        items = [f for f in items if int(f.get("stops") or 0) == 0]
-    else:
-        items = [f for f in items if int(f.get("stops") or 0) <= max_stops]
-
-    if sort_by == "價格由低到高":
-        items.sort(key=lambda f: (f.get("price") is None, f.get("price") or 10**12))
-    elif sort_by == "時長由短到長":
-        items.sort(key=lambda f: (_duration_minutes(f.get("duration")), f.get("price") or 10**12))
-    elif sort_by == "出發時間":
-        items.sort(key=lambda f: (f.get("departure_time") or "9999", f.get("price") or 10**12))
-    elif sort_by == "直飛優先":
-        items.sort(
-            key=lambda f: (
-                int(f.get("stops") or 0),
-                f.get("price") if f.get("price") is not None else 10**12,
-            )
-        )
-    return items
-
-
-def render_price_insight(stats: dict, current_price: float | None) -> None:
-    """價格洞察：相對歷史最低 / 平均。"""
-    if not stats or not stats.get("count"):
-        st.caption("尚無足夠歷史資料做比價洞察，再查幾次後會更準。")
-        return
-
-    min_p = stats.get("min_price")
-    avg_p = stats.get("avg_price")
-    max_p = stats.get("max_price")
-    scope = "同日期" if stats.get("scope") == "exact" else "同航線"
-    chips = []
-    if current_price is not None and min_p is not None:
-        if current_price <= min_p * 1.01:
-            chips.append('<span class="chip green">歷史低點附近</span>')
-        elif avg_p and current_price <= avg_p * 0.95:
-            chips.append('<span class="chip green">低於歷史均價</span>')
-        elif avg_p and current_price >= avg_p * 1.08:
-            chips.append('<span class="chip amber">高於歷史均價</span>')
-        else:
-            chips.append('<span class="chip">接近歷史均價</span>')
-
-    vs_min = ""
-    vs_avg = ""
-    if current_price is not None and min_p:
-        diff = current_price - min_p
-        pct = (diff / min_p) * 100 if min_p else 0
-        vs_min = f"+{diff:,.0f}（+{pct:.0f}%）" if diff > 0 else "持平或更低"
-    if current_price is not None and avg_p:
-        diff = current_price - avg_p
-        pct = (diff / avg_p) * 100 if avg_p else 0
-        vs_avg = f"{diff:+,.0f}（{pct:+.0f}%）"
-
-    chips_html = "".join(chips)
+    inbound = _flight_leg_payload(
+        returning,
+        flight_date=result.get("return_date"),
+        origin=str(result.get("destination") or "---"),
+        destination=str(result.get("origin") or "---"),
+    )
     st.html(
-        (
-            f'<div class="stat-card" style="margin-bottom:0.85rem;border-left:3px solid #3b82f6">'
-            f'<div class="k">價格洞察 · {scope} · {stats.get("count", 0)} 筆</div>'
-            f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:0.45rem;margin-top:0.55rem">'
-            f"<div>"
-            f'<div style="font-size:0.66rem;color:#64748b;font-weight:700;letter-spacing:0.06em;text-transform:uppercase">歷史最低</div>'
-            f'<div style="font-weight:700;color:#0f766e;font-family:IBM Plex Mono,monospace">NT$ {min_p:,.0f}</div>'
-            f"</div><div>"
-            f'<div style="font-size:0.66rem;color:#64748b;font-weight:700;letter-spacing:0.06em;text-transform:uppercase">歷史均價</div>'
-            f'<div style="font-weight:700;color:#1e293b;font-family:IBM Plex Mono,monospace">NT$ {avg_p:,.0f}</div>'
-            f"</div><div>"
-            f'<div style="font-size:0.66rem;color:#64748b;font-weight:700;letter-spacing:0.06em;text-transform:uppercase">歷史最高</div>'
-            f'<div style="font-weight:700;color:#92400e;font-family:IBM Plex Mono,monospace">NT$ {max_p:,.0f}</div>'
-            f"</div></div>"
-            f'<div style="margin-top:0.55rem;font-size:0.82rem;color:#64748b;border-top:1px solid #e8edf3;padding-top:0.45rem">'
-            f'相對最低：<b style="color:#1e293b">{vs_min or "—"}</b>'
-            f'&nbsp;｜&nbsp;相對均價：<b style="color:#1e293b">{vs_avg or "—"}</b>'
-            f"</div>"
-            f'<div style="margin-top:0.5rem">{chips_html}</div>'
-            f"</div>"
-        ))
+        ui.flight_pair_card(
+            outbound,
+            inbound,
+            total_price=flight.get("price"),
+            currency=result.get("currency") or "TWD",
+            best=best,
+            price_note=f"{int(result.get('adults') or 1)} 位旅客行程總價",
+        )
+    )
+    return True
 
 
-def page_dashboard():
-    inject_hero(
-        "儀表板",
-        "掌握監控任務、價格變化與通知狀態",
-        ["即時狀態", "自動查價", "TWD"],
-        kicker="OVERVIEW",
-    )
-    channels = configured_channels()
-    notification_health = get_notification_health()
-    inject_cmd_bar(
-        api_ok=flight_api_ready(),
-        channels=channels,
-        cooldown_h=NOTIFY_COOLDOWN_HOURS,
-        extra=f"最近推播 {notification_health['label']}",
-    )
+def _upload_to_temp(upload: Any, suffix: str) -> Path:
+    with tempfile.NamedTemporaryFile(prefix="skywatch-upload-", suffix=suffix, delete=False) as handle:
+        handle.write(upload.getvalue())
+        return Path(handle.name)
+
+
+def page_dashboard() -> None:
+    health = get_scheduler_health()
     stats = db.get_dashboard_stats()
-    avg = stats.get("avg_recent_price")
-    hit_ratio = 0
-    if stats.get("active_monitors"):
-        hit_ratio = round((stats.get("hit_count") or 0) / max(stats["active_monitors"], 1) * 100)
+    usage = db.get_api_usage_summary("serpapi", SERPAPI_MONTHLY_LIMIT)
+    runs = db.list_check_runs(limit=6)
+    outbox = db.list_notification_outbox(limit=200)
+    failed_outbox = sum(item.get("status") == "failed" for item in outbox)
 
-    render_kpi_row(
+    _page_header(
+        "營運總覽",
+        "一眼確認排程、額度、票價監控與通知是否正常。",
+        eyebrow="OPERATIONS",
+        badges=[
+            {"text": "系統正常" if health["healthy"] else "需要檢查", "tone": "success" if health["healthy"] else "warning"},
+            {"text": f"{len(configured_channels())} 個通知管道", "tone": "info"},
+        ],
+    )
+
+    if health["healthy"]:
+        st.html(
+            ui.status_banner(
+                "排程器運作正常",
+                f"最近心跳 {_format_datetime(health['updated_at'])}，下一次預計 {_format_datetime(health['next_run'])}。",
+                status="success",
+                label="即時",
+                details=[f"已自動補跑 {health['recovered_count']} 次", f"通知重試 {health['retry_count']} 次"],
+            )
+        )
+    else:
+        details = [f"最後心跳：{_format_datetime(health['updated_at'])}"]
+        if health.get("last_error"):
+            details.append(f"最近錯誤：{health['last_error']}")
+        st.html(
+            ui.status_banner(
+                "排程器未回報正常心跳",
+                "介面本身可以使用，但自動查價可能沒有持續執行。請到「系統設定」查看啟動方式。",
+                status="danger",
+                label="需處理",
+                details=details,
+            )
+        )
+
+    _metric_row(
         [
-            {
-                "label": "啟用監控",
-                "value": f"{stats['active_monitors']}",
-                "sub": f"總檔案 {stats['total_monitors']} 筆",
-                "trend": "ACTIVE WATCH",
-                "trend_cls": "",
-                "accent": "accent-navy",
-            },
-            {
-                "label": "已達標",
-                "value": f"{stats['hit_count']}",
-                "sub": f"命中率 {hit_ratio}%",
-                "trend": "可考慮下單" if stats["hit_count"] else "持續追蹤",
-                "trend_cls": "" if stats["hit_count"] else "neutral",
-                "accent": "accent-gold",
-            },
-            {
-                "label": "追蹤航線",
-                "value": f"{stats['routes']}",
-                "sub": "已建檔 Origin → Destination",
-                "trend": "NETWORK",
-                "trend_cls": "neutral",
-                "accent": "accent-navy",
-            },
-            {
-                "label": "24h 通知",
-                "value": f"{stats['notifications_24h']}",
-                "sub": f"近 20 筆均價 {('NT$ ' + format(avg, ',.0f')) if avg else '—'}",
-                "trend": "ALERT STREAM",
-                "trend_cls": "warn" if stats["notifications_24h"] else "neutral",
-                "accent": "accent-teal",
-            },
+            {"label": "啟用中監控", "value": stats["active_monitors"], "caption": f"共 {stats['total_monitors']} 筆", "tone": "primary", "icon": "◎"},
+            {"label": "達到目標價", "value": stats["hit_count"], "caption": "目前啟用項目", "tone": "success", "icon": "↓"},
+            {"label": "24 小時成功通知", "value": stats["notifications_24h"], "caption": f"共嘗試 {stats['notification_attempts_24h']} 次", "tone": "info", "icon": "↗"},
+            {"label": "待處理通知異常", "value": failed_outbox, "caption": "可在執行與通知重試", "tone": "danger" if failed_outbox else "neutral", "icon": "!"},
         ]
     )
 
-    c1, c2 = st.columns([1.05, 1])
+    left, right = st.columns([1.25, 1])
+    with left:
+        st.html(ui.section_heading("API 額度", "每次網路查價都會計入嘗試次數。", eyebrow="QUOTA"))
+        if usage["limit"]:
+            st.html(
+                ui.quota_meter(
+                    usage["attempted"],
+                    usage["limit"],
+                    label="SerpAPI 每月額度",
+                    mode=f"警戒 {API_USAGE_WARNING_PERCENT:.0f}%",
+                    reset_at="下個月",
+                )
+            )
+        else:
+            st.info(f"本月已嘗試 {usage['attempted']} 次；尚未設定月額度上限。")
+        active = db.list_monitors(active_only=True)
+        projected = sum(
+            _quota_forecast(str(item.get("quota_mode") or "full"), _monitor_runs_per_day(item))["monthly_requests"]
+            for item in active
+        )
+        st.caption(f"依目前每筆監控策略粗估，每月最多約 {projected:,} 次供應商請求。")
+    with right:
+        st.html(ui.section_heading("服務狀態", "健康狀態來自實際設定與 heartbeat。", eyebrow="HEALTH"))
+        c1, c2 = st.columns(2)
+        with c1:
+            st.html(
+                ui.status_card(
+                    "即時票價",
+                    "可用" if flight_api_ready() else "未設定",
+                    status="success" if flight_api_ready() else "danger",
+                    description="SerpAPI",
+                )
+            )
+        with c2:
+            channels = configured_channels()
+            external = [item for item in channels if "only" not in item.lower()]
+            st.html(
+                ui.status_card(
+                    "外部通知",
+                    "、".join(external) if external else "僅本機紀錄",
+                    status="success" if external else "warning",
+                    description="可靠佇列與失敗重試",
+                )
+            )
+
+    st.html(ui.section_heading("最近執行", "查價、漏跑補查與手動檢查皆留下可追溯紀錄。", eyebrow="RUN LEDGER"))
+    if not runs:
+        st.html(ui.empty_state("尚無執行紀錄", "建立監控並執行一次查價後，這裡會顯示結果。", icon="○"))
+    else:
+        for run in runs:
+            route = f"{run.get('origin') or '—'} → {run.get('destination') or '—'}"
+            message = str(run.get("error_message") or f"API {int(run.get('api_calls') or 0)} 次 · {run.get('trigger') or 'unknown'}")
+            st.html(
+                ui.run_status(
+                    str(run.get("status") or "unknown"),
+                    title=route,
+                    message=message,
+                    timestamp=_format_datetime(run.get("started_at")),
+                )
+            )
+
+    st.html(ui.section_heading("重點監控", "優先顯示已達標或最近檢查的航線。", eyebrow="MONITORS"))
+    if not stats["top_monitors"]:
+        st.html(ui.empty_state("尚未建立監控", "先到「搜尋與比較」完成一次即時查價並建立策略。", icon="✈"))
+    else:
+        for monitor in stats["top_monitors"]:
+            st.html(
+                ui.monitor_card(
+                    monitor["origin"],
+                    monitor["destination"],
+                    outbound_date=monitor["outbound_date"],
+                    return_date=monitor.get("return_date") or "",
+                    target_price=monitor.get("target_price"),
+                    current_price=monitor.get("last_price"),
+                    active=bool(monitor.get("active")),
+                    hit=bool(monitor.get("last_price") is not None and float(monitor["last_price"]) <= float(monitor["target_price"])),
+                    monitor_id=monitor["id"],
+                    schedule=_schedule_label(monitor.get("schedule_type"), monitor.get("schedule_value")),
+                    notification_policy=NOTIFICATION_LABELS.get(str(monitor.get("notification_policy") or "always"), "—"),
+                )
+            )
+
+
+def _render_search_results(result: dict[str, Any]) -> None:
+    flights = result.get("flights") or []
+    best = result.get("best_price")
+    st.html(ui.section_heading("即時比較結果", format_flight_summary(result), eyebrow="LIVE FARES"))
+    _metric_row(
+        [
+            {"label": "目前最低總價", "value": _currency(best), "caption": result.get("currency", "TWD"), "tone": "success", "icon": "↓"},
+            {"label": "可比較組合", "value": len(flights), "caption": "同一次查詢結果", "tone": "primary", "icon": "≡"},
+            {"label": "旅客", "value": result.get("adults", 1), "caption": CLASS_NAMES.get(int(result.get("travel_class") or 1), "經濟艙"), "tone": "neutral", "icon": "○"},
+        ]
+    )
+    if not flights:
+        st.warning("供應商目前沒有回傳可比較的航班。")
+        return
+
+    filter1, filter2, filter3 = st.columns(3)
+    direct = filter1.checkbox("只顯示直飛", key="search_result_direct")
+    max_stops = filter2.selectbox("最多轉機", [0, 1, 2, 3], index=2, disabled=direct, key="search_result_stops")
+    sort = filter3.selectbox("排序", ["價格", "直飛優先", "出發時間"], key="search_result_sort")
+    shown = [item for item in flights if int(item.get("stops") or 0) <= (0 if direct else int(max_stops))]
+    if sort == "直飛優先":
+        shown.sort(key=lambda item: (int(item.get("stops") or 0), float(item.get("price") or 10**12)))
+    elif sort == "出發時間":
+        shown.sort(key=lambda item: str(item.get("departure_time") or "99:99"))
+    else:
+        shown.sort(key=lambda item: float(item.get("price") or 10**12))
+    paired: list[dict[str, Any]] = []
+    if result.get("return_date"):
+        paired = [item for item in shown if isinstance(item.get("return_flight") or item.get("returning"), dict)]
+        national_codes = {AirlineCode(code) for code, _ in AIRLINES}
+        other_pairs = [
+            item
+            for item in paired
+            if normalize_airline(item.get("airline"), item.get("flight_number")) not in national_codes
+        ]
+        if other_pairs:
+            st.html(
+                ui.section_heading(
+                    "其他完整來回航班組合",
+                    "去程與回程屬於同一筆供應商行程總價；三大國籍航空在下方獨立比較。",
+                    eyebrow="PAIRED ITINERARIES",
+                )
+            )
+            for index, flight in enumerate(other_pairs[:6]):
+                _render_flight_pair(result, flight, best=index == 0)
+        elif not paired:
+            st.warning("目前只有完整來回總價，尚未取得回程班次；完整模式將補查。")
+    table = []
+    for index, flight in enumerate(shown[:20], start=1):
+        returning = flight.get("return_flight") or flight.get("returning")
+        row = {
+            "排序": index,
+            "航空公司": flight.get("airline") or "未知",
+            "去程航班": flight.get("flight_number") or "—",
+            "去程出發": flight.get("departure_time") or "—",
+            "去程抵達": flight.get("arrival_time") or "—",
+            "轉機": int(flight.get("stops") or 0),
+            "時間": flight.get("duration") or "—",
+            "行程總價": float(flight.get("price") or 0),
+        }
+        if result.get("return_date"):
+            row["回程航班"] = returning.get("flight_number") or "—" if isinstance(returning, dict) else "待補查"
+            row["回程出發"] = returning.get("departure_time") or "—" if isinstance(returning, dict) else "待補查"
+        table.append(row)
+
+    def render_result_table() -> None:
+        st.dataframe(
+            pd.DataFrame(table),
+            hide_index=True,
+            use_container_width=True,
+            column_config={"行程總價": st.column_config.NumberColumn(format="NT$ %.0f")},
+        )
+
+    if result.get("return_date") and paired:
+        with st.expander("查看其他票價組合、去程摘要與回程資料狀態", expanded=False):
+            st.caption("所有金額都是同一次查詢的完整來回行程總價；「待補查」不代表只有去程。")
+            render_result_table()
+    else:
+        if result.get("return_date"):
+            st.caption("所有金額都是完整來回行程總價；回程班次將依監控的額度模式補查。")
+        render_result_table()
+    national: list[dict[str, Any]] = []
+    for code, name in AIRLINES:
+        airline_code = AirlineCode(code)
+        candidates = [
+            item
+            for item in shown
+            if normalize_airline(item.get("airline"), item.get("flight_number")) == airline_code
+        ]
+        if candidates:
+            best_flight = min(candidates, key=lambda item: float(item.get("price") or 10**12))
+            national.append(
+                {
+                    "航空公司": name,
+                    "最低行程總價": float(best_flight["price"]),
+                    "可比較組合": len(candidates),
+                    "best_flight": best_flight,
+                }
+            )
+    st.html(ui.section_heading("三大國籍航空", "只以本次完整行程報價比較，不拼接不同查詢的單程價格。", eyebrow="TAIWAN CARRIERS"))
+    if national:
+        if result.get("return_date"):
+            paired_national = [
+                carrier
+                for carrier in national
+                if isinstance(
+                    carrier["best_flight"].get("return_flight") or carrier["best_flight"].get("returning"),
+                    dict,
+                )
+            ]
+            unpaired_national = [carrier for carrier in national if carrier not in paired_national]
+            for carrier in paired_national:
+                st.markdown(f"**{carrier['航空公司']}**")
+                _render_flight_pair(
+                    result,
+                    carrier["best_flight"],
+                    best=float(carrier["best_flight"].get("price") or 10**12)
+                    == min(float(item.get("price") or 10**12) for item in shown),
+                )
+            if unpaired_national:
+                st.caption("下列航空公司已有完整來回總價，但回程班次仍待完整模式補查。")
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "航空公司": carrier["航空公司"],
+                                "最低行程總價": carrier["最低行程總價"],
+                                "可比較組合": carrier["可比較組合"],
+                                "回程資料": "待完整模式補查",
+                            }
+                            for carrier in unpaired_national
+                        ]
+                    ),
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={"最低行程總價": st.column_config.NumberColumn(format="NT$ %.0f")},
+                )
+        else:
+            st.dataframe(
+                pd.DataFrame([{key: value for key, value in item.items() if key != "best_flight"} for item in national]),
+                hide_index=True,
+                use_container_width=True,
+                column_config={"最低行程總價": st.column_config.NumberColumn(format="NT$ %.0f")},
+            )
+    else:
+        st.caption("本次回應沒有三大國籍航空的可用組合。")
+
+
+def _create_monitor_from_result(result: dict[str, Any]) -> None:
+    st.html(ui.section_heading("建立監控策略", "把查價結果轉成可獨立排程與通知的監控。", eyebrow="CORE FLOW"))
+    flow_step = max(1, min(2, int(st.session_state.get("monitor_flow_step", 1))))
+    st.html(ui.stepper(["完成查價", "設定條件", "確認排程"], current=flow_step))
+    default_target = max(100, int(float(result.get("best_price") or 10000) * 0.9))
+    with st.form("create_monitor_form"):
+        general, quota_tab, airline_tab, delivery_tab = st.tabs(["目標", "額度", "航空條件", "排程與通知"])
+        with general:
+            target = st.number_input("一般目標總價", min_value=100.0, max_value=1_000_000.0, value=float(default_target), step=100.0)
+            st.caption("一般目標價適用於所有航空公司；下方專屬規則可另外覆蓋三家國籍航空。")
+        with quota_tab:
+            quota_mode = st.radio(
+                "額度模式",
+                ["lean", "standard", "full"],
+                index=1,
+                format_func=lambda item: f"{QUOTA_LABELS[item]} · 每次最多 {QuotaPolicy(mode=item).max_requests_per_run} 個請求",
+                key="create_quota_mode",
+            )
+            st.caption("精簡適合大量監控；完整模式可補查更多回程或開票細節，但消耗額度較快。")
+        with airline_tab:
+            airline_rules = _airline_rule_fields(
+                "create",
+                round_trip=bool(result.get("return_date")),
+            )
+        with delivery_tab:
+            schedule_type, schedule_value, schedule = _schedule_fields("create")
+            notification_strategy, quiet_hours = _notification_fields("create")
+            forecast = _quota_forecast(quota_mode, schedule.runs_per_day)
+            st.caption(
+                f"此監控預估每月最多 {forecast['monthly_requests']:,} 次請求；"
+                f"目前剩餘 {forecast['remaining'] if forecast['remaining'] is not None else '未設定上限'} 次。"
+            )
+        with st.container(border=True):
+            st.markdown("**建立前確認摘要**")
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("航線", f"{result.get('origin') or '—'} → {result.get('destination') or '—'}")
+            s2.metric("目標總價", _currency(target))
+            s3.metric("額度模式", QUOTA_LABELS[quota_mode])
+            s4.metric("每月最多", f"{forecast['monthly_requests']:,} 次")
+            st.caption(
+                f"{result.get('outbound_date') or '—'}"
+                f"{' → ' + str(result.get('return_date')) if result.get('return_date') else ' · 單程'} · "
+                f"{_schedule_label(schedule_type, schedule_value)} · "
+                f"{NOTIFICATION_LABELS[notification_strategy]} · "
+                f"{len(airline_rules)} 家航空公司專屬條件"
+            )
+            confirmation = st.checkbox(
+                "我已確認日期、目標價、額度成本、排程與通知策略",
+                key="create_monitor_confirmation",
+            )
+        submitted = st.form_submit_button("建立監控", type="primary", use_container_width=True)
+    if submitted:
+        if not confirmation:
+            st.session_state["monitor_flow_step"] = 1
+            st.warning("請先確認摘要內容，再建立監控。")
+            return
+        try:
+            rules = AirlineRuleSet.from_dict(airline_rules).to_dict()["rules"]
+            NotificationPolicy.from_dict({"strategy": notification_strategy, "quiet_hours": quiet_hours or None})
+            validated_schedule = _schedule_policy(schedule_type, schedule_value)
+            next_run = validated_schedule.next_run(_now()).isoformat(timespec="seconds")
+            saved = db.add_monitor(
+                route_id=int(result["route_id"]),
+                outbound_date=str(result["outbound_date"]),
+                return_date=result.get("return_date") or None,
+                target_price=float(target),
+                adults=int(result.get("adults") or 1),
+                travel_class=int(result.get("travel_class") or 1),
+                trip_type="round_trip" if result.get("return_date") else "one_way",
+                quota_mode=quota_mode,
+                airline_rules=rules,
+                schedule_type=schedule_type,
+                schedule_value=schedule_value,
+                notification_policy=notification_strategy,
+                quiet_hours=quiet_hours,
+                next_run_at=next_run,
+            )
+            st.session_state["monitor_flow_step"] = 2
+            if saved.get("duplicate"):
+                st.info(f"相同行程已存在；已更新監控 #{saved['id']} 的完整策略。")
+            else:
+                st.success(f"已建立監控 #{saved['id']}，下次預計 {_format_datetime(next_run)} 執行。")
+        except (TypeError, ValueError) as exc:
+            st.error(f"策略無法儲存：{exc}")
+
+
+def page_search() -> None:
+    _page_header(
+        "搜尋與比較",
+        "先用一次即時查詢取得完整行程價格，再建立監控策略。",
+        eyebrow="SEARCH",
+        badges=[{"text": "SerpAPI 即時驗證", "tone": "success" if flight_api_ready() else "danger"}],
+    )
+    st.html(
+        ui.status_banner(
+            "這個動作會消耗 1 次 SerpAPI 額度",
+            "只有按下搜尋後才會連線；重新整理頁面不會重複查價。",
+            status="info",
+            label="成本提示",
+        )
+    )
+    left, right = st.columns(2)
+    with left:
+        origin = _airport_input("出發機場", "search_origin", "TPE")
+    with right:
+        destination = _airport_input("目的機場", "search_destination", "KIX")
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.html('<div class="section-label">目前監控</div>')
-        tops = stats.get("top_monitors") or []
-        if not tops:
-            st.html(
-                '<div class="empty-state"><div class="icon">📡</div><div>尚無啟用監控，先到「搜尋航班」建立第一筆任務</div></div>')
-        else:
-            for m in tops:
-                last_p = m.get("last_price")
-                target = m.get("target_price") or 0
-                hit = last_p is not None and last_p <= target
-                last_txt = f"NT$ {last_p:,.0f}" if last_p is not None else "尚未檢查"
-                trip = m["outbound_date"]
-                if m.get("return_date"):
-                    trip += f" ⇄ {m['return_date']}"
-                gap = ""
-                if last_p is not None and target:
-                    diff = last_p - target
-                    gap = f"距目標 {diff:+,.0f}"
-                card_cls = "mon-hit" if hit else "mon-active"
-                gap_chip = f'<span class="chip gold">{gap}</span>' if gap else ""
-                hit_chip = "green" if hit else "amber"
-                hit_txt = "已達標" if hit else "追蹤中"
-                st.html(
-                    (
-                        f'<div class="mon-card {card_cls}">'
-                        f'<div style="display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap">'
-                        f"<div>"
-                        f'<div style="font-weight:700;color:#1e293b;font-size:1.02rem">{m["origin"]} → {m["destination"]}</div>'
-                        f'<div style="color:#64748b;font-size:0.8rem;margin-top:0.22rem">{trip}</div>'
-                        f'<div style="margin-top:0.5rem">'
-                        f'<span class="chip">目標 ≤ NT$ {target:,.0f}</span>'
-                        f'<span class="chip {hit_chip}">{hit_txt}</span>'
-                        f"{gap_chip}"
-                        f"</div></div>"
-                        f'<div style="text-align:right">'
-                        f'<div style="color:#64748b;font-size:0.7rem;letter-spacing:0.06em;text-transform:uppercase;font-weight:650">Last Price</div>'
-                        f'<div style="font-weight:700;color:#087443;font-size:1.25rem;font-family:IBM Plex Mono,monospace">{last_txt}</div>'
-                        f"</div></div></div>"
-                    ))
+        trip_type = st.radio("行程", ["來回", "單程"], horizontal=True)
     with c2:
-        st.html('<div class="section-label">最近查價紀錄</div>')
-        recent = stats.get("recent_history") or []
-        if not recent:
-            st.html(
-                '<div class="empty-state"><div class="icon">📈</div><div>尚無價格歷史，完成一次查價後會顯示於此</div></div>')
+        outbound = st.date_input("出發日期", value=date.today() + timedelta(days=30), min_value=date.today())
+    with c3:
+        return_date = (
+            st.date_input("回程日期", value=outbound + timedelta(days=7), min_value=outbound)
+            if trip_type == "來回"
+            else None
+        )
+    with c4:
+        adults = int(st.number_input("成人", min_value=1, max_value=9, value=1))
+        class_label = st.selectbox("艙等", list(CLASS_CODES))
+    confirm = st.checkbox("我了解本次即時搜尋會使用 1 次 SerpAPI 額度", key="confirm_live_search")
+    search_button_type = "secondary" if st.session_state.get("search_result") else "primary"
+    if st.button("搜尋即時票價", type=search_button_type, use_container_width=True, disabled=not confirm):
+        if origin == destination:
+            st.error("出發地與目的地不可相同。")
+        elif not flight_api_ready():
+            st.error("尚未設定 SERPAPI_API_KEY，請先到系統設定確認。")
         else:
+            try:
+                with st.spinner("正在查詢即時票價並寫入歷史紀錄…"):
+                    result = search_and_save(
+                        origin=origin,
+                        destination=destination,
+                        outbound_date=outbound.isoformat(),
+                        return_date=return_date.isoformat() if return_date else None,
+                        adults=adults,
+                        travel_class=CLASS_CODES[class_label],
+                    )
+                st.session_state["search_result"] = result
+                st.session_state["monitor_flow_step"] = 1
+                st.session_state["create_monitor_confirmation"] = False
+                st.success("查價完成。")
+            except FlightAPIError as exc:
+                st.error(f"查價失敗：{exc}")
+            except Exception as exc:
+                st.error(f"查價流程發生未預期錯誤：{exc}")
+    result = st.session_state.get("search_result")
+    if not result:
+        st.html(ui.empty_state("尚無查詢結果", "設定行程並確認額度成本後開始查價。", icon="✈"))
+        return
+    _render_search_results(result)
+    _create_monitor_from_result(result)
+
+
+def _render_monitor_summary(monitor: dict[str, Any]) -> None:
+    rules = _json_list(monitor.get("airline_rules_json"))
+    st.html(
+        ui.monitor_card(
+            monitor["origin"],
+            monitor["destination"],
+            outbound_date=monitor["outbound_date"],
+            return_date=monitor.get("return_date") or "",
+            target_price=monitor.get("target_price"),
+            current_price=monitor.get("last_price"),
+            active=bool(monitor.get("active")),
+            hit=bool(monitor.get("last_price") is not None and float(monitor["last_price"]) <= float(monitor["target_price"])),
+            monitor_id=monitor["id"],
+            airlines=[dict(AIRLINES).get(str(item.get("airline")), str(item.get("airline"))) for item in rules],
+            direct_only=any(bool(item.get("direct_only")) for item in rules),
+            schedule=_schedule_label(monitor.get("schedule_type"), monitor.get("schedule_value")),
+            notification_policy=NOTIFICATION_LABELS.get(str(monitor.get("notification_policy") or "always"), "—"),
+        )
+    )
+
+
+def page_monitors() -> None:
+    monitors = db.list_monitors(active_only=False)
+    active_count = sum(bool(item.get("active")) for item in monitors)
+    _page_header(
+        "監控策略",
+        "每筆行程都有自己的航空條件、額度模式、排程與通知規則。",
+        eyebrow="MONITOR POLICIES",
+        badges=[{"text": f"{active_count} 筆啟用", "tone": "success"}, {"text": f"共 {len(monitors)} 筆", "tone": "neutral"}],
+    )
+    if not monitors:
+        st.html(ui.empty_state("尚未建立監控", "先到「搜尋與比較」完成即時查價，再建立第一筆策略。", icon="◎"))
+        return
+
+    selector = {
+        f"#{item['id']} · {item['origin']} → {item['destination']} · {item['outbound_date']}": item
+        for item in monitors
+    }
+    selected_label = st.selectbox("選擇要管理的監控", list(selector))
+    monitor = db.get_monitor(int(selector[selected_label]["id"])) or selector[selected_label]
+    _render_monitor_summary(monitor)
+
+    status_col, check_col = st.columns(2)
+    with status_col:
+        desired_active = not bool(monitor.get("active"))
+        label = "重新啟用" if desired_active else "暫停監控"
+        if st.button(label, use_container_width=True):
+            try:
+                db.set_monitor_active(int(monitor["id"]), desired_active)
+                st.success(f"監控 #{monitor['id']} 已{'啟用' if desired_active else '暫停'}。")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"狀態更新失敗：{exc}")
+    with check_col:
+        max_calls = QuotaPolicy(mode=str(monitor.get("quota_mode") or "full")).max_requests_per_run
+        confirm_check = st.checkbox(
+            f"了解手動檢查最多使用 {max_calls} 次額度",
+            key=f"manual_check_confirm_{monitor['id']}",
+        )
+        if st.button("立即檢查這筆監控", disabled=not confirm_check, use_container_width=True):
+            try:
+                with st.spinner("正在執行即時查價…"):
+                    result = check_one_monitor(monitor, trigger="manual")
+                st.session_state[f"monitor_result_{monitor['id']}"] = result
+                if result.get("ok"):
+                    st.success(
+                        f"檢查完成：{_currency(result.get('best_price'))}；"
+                        f"通知狀態 {result.get('notify_reason') or '—'}。"
+                    )
+                else:
+                    st.error(f"檢查失敗：{result.get('error') or '未知錯誤'}")
+            except Exception as exc:
+                st.error(f"手動檢查失敗：{exc}")
+
+    st.html(ui.section_heading("編輯策略", "儲存後會重新計算下一次執行時間。", eyebrow="POLICY EDITOR"))
+    existing_rules = _json_list(monitor.get("airline_rules_json"))
+    existing_quiet = _json_dict(monitor.get("quiet_hours_json"))
+    prefix = f"edit_{monitor['id']}"
+    with st.form(f"edit_monitor_{monitor['id']}"):
+        base_tab, quota_tab, airline_tab, schedule_tab = st.tabs(["目標", "額度", "航空條件", "排程與通知"])
+        with base_tab:
+            st.metric("一般目標總價", _currency(monitor.get("target_price")))
+            st.caption(
+                f"{int(monitor.get('adults') or 1)} 位成人 · "
+                f"{CLASS_NAMES.get(int(monitor.get('travel_class') or 1), '經濟艙')}"
+            )
+            st.info("一般目標價屬於行程基本資料；請從「搜尋與比較」重新確認即時價格後更新。此頁只編輯已支援的策略欄位。")
+        with quota_tab:
+            modes = list(QUOTA_LABELS)
+            current_mode = str(monitor.get("quota_mode") or "full")
+            quota_mode = st.radio(
+                "額度模式",
+                modes,
+                index=modes.index(current_mode) if current_mode in modes else 2,
+                format_func=lambda item: f"{QUOTA_LABELS[item]} · 每次最多 {QuotaPolicy(mode=item).max_requests_per_run} 次",
+                key=f"{prefix}_quota",
+            )
+        with airline_tab:
+            airline_rules = _airline_rule_fields(
+                prefix,
+                existing_rules,
+                round_trip=bool(monitor.get("return_date")),
+            )
+        with schedule_tab:
+            schedule_type, schedule_value, schedule = _schedule_fields(
+                prefix,
+                str(monitor.get("schedule_type") or "global"),
+                str(monitor.get("schedule_value") or ""),
+            )
+            notification_strategy, quiet_hours = _notification_fields(
+                prefix,
+                str(monitor.get("notification_policy") or "always"),
+                existing_quiet,
+            )
+            forecast = _quota_forecast(quota_mode, schedule.runs_per_day)
+            st.caption(f"這筆策略每月最多約 {forecast['monthly_requests']:,} 次供應商請求。")
+        save = st.form_submit_button("儲存策略", type="primary", use_container_width=True)
+    if save:
+        try:
+            validated_rules = AirlineRuleSet.from_dict(airline_rules).to_dict()["rules"]
+            NotificationPolicy.from_dict({"strategy": notification_strategy, "quiet_hours": quiet_hours or None})
+            validated_schedule = _schedule_policy(schedule_type, schedule_value)
+            next_run = validated_schedule.next_run(_now()).isoformat(timespec="seconds")
+            db.update_monitor_policies(
+                int(monitor["id"]),
+                target_price=float(target),
+                quota_mode=quota_mode,
+                airline_rules=validated_rules,
+                schedule_type=schedule_type,
+                schedule_value=schedule_value,
+                notification_policy=notification_strategy,
+                quiet_hours=quiet_hours,
+                next_run_at=next_run,
+            )
+            st.success(f"策略已儲存；下次預計 {_format_datetime(next_run)} 執行。")
+        except (TypeError, ValueError) as exc:
+            st.error(f"策略驗證失敗：{exc}")
+        except Exception as exc:
+            st.error(f"策略儲存失敗：{exc}")
+
+    with st.expander("刪除這筆監控"):
+        st.warning("刪除監控不會刪除既有票價與執行紀錄，但此動作無法復原。")
+        expected = f"DELETE #{monitor['id']}"
+        confirmation = st.text_input(f"輸入 {expected} 確認", key=f"delete_monitor_{monitor['id']}")
+        if st.button("永久刪除監控", disabled=confirmation != expected, key=f"delete_button_{monitor['id']}"):
+            try:
+                db.delete_monitor(int(monitor["id"]))
+                st.success("監控已刪除。")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"刪除失敗：{exc}")
+
+
+def _history_rows(route_id: int) -> list[dict[str, Any]]:
+    with db.get_db() as connection:
+        rows = connection.execute(
+            """
+            SELECT h.*, r.origin, r.destination
+            FROM price_history h JOIN routes r ON r.id=h.route_id
+            WHERE h.route_id=? ORDER BY h.recorded_at ASC
+            """,
+            (int(route_id),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def page_price_intelligence() -> None:
+    routes = db.list_routes()
+    _page_header(
+        "價格情報",
+        "結合本機即時查價歷史與 Travelpayouts 彈性日期快取趨勢。",
+        eyebrow="PRICE INTELLIGENCE",
+        badges=[
+            {"text": "即時紀錄", "tone": "primary"},
+            {"text": "快取月曆", "tone": "info" if travelpayouts_ready() else "neutral"},
+        ],
+    )
+    history_tab, calendar_tab = st.tabs(["票價歷史", "低價月曆"])
+    with history_tab:
+        if not routes:
+            st.html(ui.empty_state("尚無票價歷史", "先到搜尋頁完成一次即時查價。", icon="↗"))
+        else:
+            route_map = {f"{item['origin']} → {item['destination']} · {item.get('origin_name') or ''}": item for item in routes}
+            selected = route_map[st.selectbox("選擇航線", list(route_map), key="history_route")]
+            rows = _history_rows(int(selected["id"]))
+            if not rows:
+                st.info("這條航線尚無可繪製的價格紀錄。")
+            else:
+                frame = pd.DataFrame(rows)
+                frame["recorded_at"] = pd.to_datetime(frame["recorded_at"], errors="coerce")
+                frame["行程"] = frame.apply(
+                    lambda row: (
+                        f"{row['outbound_date']} → {row['return_date']}"
+                        if pd.notna(row.get("return_date")) and str(row.get("return_date") or "")
+                        else str(row["outbound_date"])
+                    ),
+                    axis=1,
+                )
+                itinerary_choices = list(frame["行程"].dropna().unique())
+                chosen_itinerary = st.selectbox("旅行日期", itinerary_choices, key="history_itinerary")
+                shown = frame[frame["行程"] == chosen_itinerary].copy()
+                shown = shown.dropna(subset=["recorded_at", "price"])
+                if shown.empty:
+                    st.info("所選行程沒有有效價格資料。")
+                else:
+                    stats = {
+                        "最低": shown["price"].min(),
+                        "平均": shown["price"].mean(),
+                        "最新": shown.iloc[-1]["price"],
+                    }
+                    _metric_row(
+                        [
+                            {"label": label, "value": _currency(value), "tone": "success" if label == "最低" else "primary"}
+                            for label, value in stats.items()
+                        ]
+                    )
+                    figure = px.line(
+                        shown,
+                        x="recorded_at",
+                        y="price",
+                        color="airline",
+                        markers=True,
+                        labels={"recorded_at": "紀錄時間", "price": "行程總價", "airline": "航空公司"},
+                    )
+                    figure.update_layout(
+                        template="plotly_white",
+                        margin=dict(l=10, r=10, t=20, b=10),
+                        legend_title_text="航空公司",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="#ffffff",
+                    )
+                    st.plotly_chart(figure, use_container_width=True)
+                    export_columns = ["recorded_at", "outbound_date", "return_date", "price", "currency", "airline", "stops", "flight_number"]
+                    st.download_button(
+                        "下載這段歷史 CSV",
+                        data=shown[export_columns].to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"skywatch-{selected['origin']}-{selected['destination']}.csv",
+                        mime="text/csv",
+                    )
+
+    with calendar_tab:
+        st.html(
+            ui.status_banner(
+                "月曆是快取市場趨勢，不是可購買報價",
+                "查詢月曆不消耗 SerpAPI；選定日期後仍須用 1 次 SerpAPI 即時驗證，才可建立監控或觸發通知。",
+                status="warning",
+                label="必須驗證",
+            )
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            cal_origin = _airport_input("月曆出發機場", "calendar_origin", "TPE")
+        with c2:
+            cal_destination = _airport_input("月曆目的機場", "calendar_destination", "KIX")
+        q1, q2, q3 = st.columns(3)
+        with q1:
+            month_date = st.date_input("查詢月份", value=(date.today() + timedelta(days=30)).replace(day=1), key="calendar_month")
+        with q2:
+            calendar_trip = st.radio("行程類型", ["單程", "來回"], horizontal=True, key="calendar_trip")
+        with q3:
+            calendar_return = (
+                st.date_input("固定回程日期", value=month_date + timedelta(days=14), min_value=month_date, key="calendar_return")
+                if calendar_trip == "來回"
+                else None
+            )
+        st.caption("這是使用 Travelpayouts Data API 的唯讀快取查詢，不會自動建立通知。")
+        if st.button("載入低價月曆", use_container_width=True, disabled=not travelpayouts_ready()):
+            if cal_origin == cal_destination:
+                st.error("出發地與目的地不可相同。")
+            else:
+                try:
+                    with st.spinner("正在載入快取市場資料…"):
+                        calendar_data = get_low_fare_calendar(
+                            cal_origin,
+                            cal_destination,
+                            month_date.strftime("%Y-%m"),
+                            return_date=calendar_return.isoformat() if calendar_return else None,
+                        )
+                    st.session_state["fare_calendar"] = calendar_data
+                except TravelpayoutsError as exc:
+                    st.error(f"月曆查詢失敗：{exc}")
+                except Exception as exc:
+                    st.error(f"月曆流程發生未預期錯誤：{exc}")
+        if not travelpayouts_ready():
+            st.info("尚未設定 TRAVELPAYOUTS_TOKEN；請在環境設定完成後重新啟動服務。")
+        calendar_data = st.session_state.get("fare_calendar")
+        if calendar_data and calendar_data.get("days"):
+            days = pd.DataFrame(calendar_data["days"])
+            _metric_row(
+                [
+                    {"label": "快取最低價", "value": _currency(calendar_data.get("min_price")), "caption": "不可直接購買", "tone": "success"},
+                    {"label": "觀察日期", "value": calendar_data.get("observations", 0), "caption": calendar_data.get("month", ""), "tone": "info"},
+                    {"label": "即時驗證成本", "value": "1 次", "caption": "SerpAPI", "tone": "warning"},
+                ]
+            )
+            chart = px.bar(
+                days,
+                x="date",
+                y="price",
+                color="price_band",
+                color_discrete_map={"low": "#16a394", "mid": "#3b82f6", "high": "#d97706"},
+                labels={"date": "出發日期", "price": "快取趨勢價", "price_band": "價格區間"},
+            )
+            chart.update_layout(
+                template="plotly_white",
+                margin=dict(l=10, r=10, t=20, b=10),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="#ffffff",
+            )
+            st.plotly_chart(chart, use_container_width=True)
+            choices = {f"{row['date']} · {_currency(row['price'])} · {row.get('airline') or '航空未標示'}": row for row in calendar_data["days"]}
+            selected_day = choices[st.selectbox("選擇要即時驗證的日期", list(choices), key="calendar_selected_day")]
+            verify_adults = int(st.number_input("驗證成人數", min_value=1, max_value=9, value=1, key="calendar_verify_adults"))
+            verify_class_label = st.selectbox("驗證艙等", list(CLASS_CODES), key="calendar_verify_class")
+            verify_confirm = st.checkbox("我了解即時驗證會使用 1 次 SerpAPI 額度", key="calendar_verify_confirm")
+            if st.button("用 SerpAPI 驗證所選日期", type="primary", disabled=not verify_confirm, use_container_width=True):
+                if calendar_return and calendar_return < date.fromisoformat(str(selected_day["date"])):
+                    st.error("固定回程日期早於所選出發日期，請調整後再驗證。")
+                else:
+                    try:
+                        with st.spinner("正在驗證即時可用價格…"):
+                            verified = search_and_save(
+                                origin=str(calendar_data["origin"]),
+                                destination=str(calendar_data["destination"]),
+                                outbound_date=str(selected_day["date"]),
+                                return_date=calendar_return.isoformat() if calendar_return else None,
+                                adults=verify_adults,
+                                travel_class=CLASS_CODES[verify_class_label],
+                            )
+                        st.session_state["search_result"] = verified
+                        st.success(f"即時驗證完成：{format_flight_summary(verified)}。可到「搜尋與比較」建立監控。")
+                    except FlightAPIError as exc:
+                        st.error(f"即時驗證失敗：{exc}")
+                    except Exception as exc:
+                        st.error(f"驗證流程發生未預期錯誤：{exc}")
+        elif calendar_data:
+            st.info("所選月份目前沒有可用的快取市場觀察值。")
+
+
+def page_runs_and_notifications() -> None:
+    runs = db.list_check_runs(limit=200)
+    outbox = db.list_notification_outbox(limit=200)
+    notifications = db.list_notifications(limit=200)
+    _page_header(
+        "執行與通知",
+        "從每次查價到 Telegram 外送，保留狀態、失敗原因與重試軌跡。",
+        eyebrow="RUNS & DELIVERY",
+        badges=[
+            {"text": f"{len(runs)} 筆執行", "tone": "info"},
+            {"text": f"{sum(item.get('status') == 'failed' for item in outbox)} 筆通知失敗", "tone": "danger" if any(item.get('status') == 'failed' for item in outbox) else "success"},
+        ],
+    )
+    run_tab, outbox_tab, log_tab = st.tabs(["查價執行", "通知佇列", "外送紀錄"])
+    with run_tab:
+        if not runs:
+            st.html(ui.empty_state("尚無執行紀錄", "查價、排程補跑與 Telegram /check 都會出現在這裡。", icon="○"))
+        else:
+            statuses = sorted({str(item.get("status") or "unknown") for item in runs})
+            selected_statuses = st.multiselect(
+                "篩選狀態",
+                statuses,
+                default=statuses,
+                format_func=lambda status: _localized_status(status, RUN_STATUS_LABELS),
+                key="run_status_filter",
+            )
+            shown = [item for item in runs if str(item.get("status") or "unknown") in selected_statuses]
             rows = []
-            for r in recent:
+            for item in shown:
                 rows.append(
                     {
-                        "時間": r.get("recorded_at"),
-                        "航線": f"{r.get('origin')} → {r.get('destination')}",
-                        "出發日": r.get("outbound_date"),
-                        "價格": r.get("price"),
-                        "航空": r.get("airline") or "—",
+                        "開始時間": _format_datetime(item.get("started_at")),
+                        "航線": f"{item.get('origin') or '—'} → {item.get('destination') or '—'}",
+                        "觸發": _localized_status(item.get("trigger"), RUN_TRIGGER_LABELS),
+                        "狀態": _localized_status(item.get("status"), RUN_STATUS_LABELS),
+                        "API 次數": int(item.get("api_calls") or 0),
+                        "耗時 ms": item.get("duration_ms") or "—",
+                        "失敗階段": item.get("error_stage") or "—",
+                        "補跑": "是" if item.get("backfill") else "否",
+                        "ID": item.get("id"),
                     }
                 )
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=360)
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            run_map = {
+                f"{_format_datetime(item.get('started_at'))} · {item.get('origin') or '—'} → {item.get('destination') or '—'} · "
+                f"{_localized_status(item.get('status'), RUN_STATUS_LABELS)}": item
+                for item in shown
+            }
+            if run_map:
+                detail = run_map[st.selectbox("查看執行細節", list(run_map), key="run_detail")]
+                with st.container(border=True):
+                    d1, d2, d3 = st.columns(3)
+                    d1.metric("狀態", _localized_status(detail.get("status"), RUN_STATUS_LABELS))
+                    d2.metric("API 次數", int(detail.get("api_calls") or 0))
+                    d3.metric("耗時", f"{detail.get('duration_ms') or 0} ms")
+                    if detail.get("error_message"):
+                        st.error(f"{detail.get('error_stage') or 'unknown'}：{detail['error_message']}")
+                    result = _json_dict(detail.get("result_json"))
+                    if result:
+                        st.json(result, expanded=False)
+                    st.caption(f"Run ID：{detail.get('id')}")
 
-    st.html('<div class="section-label">快速操作</div>')
-    b1, b2, b3 = st.columns([1.2, 1, 1])
-    with b1:
-        if st.button("立即檢查全部監控", type="primary", use_container_width=True):
-            with st.spinner("檢查中（會呼叫 SerpAPI）…"):
-                st.session_state["check_results"] = check_all_monitors()
-            st.success("檢查完成，可到「監控中心」查看細節")
-    with b2:
-        st.html(
-            (
-                f'<div class="stat-card">'
-                f'<div class="k">通知策略</div>'
-                f'<div class="v" style="font-size:1.05rem">每次排程回報</div>'
-                f"</div>"
-            ))
-    with b3:
-        avg_txt = f"NT$ {avg:,.0f}" if avg else "—"
-        st.html(
-            (
-                f'<div class="stat-card">'
-                f'<div class="k">近 20 筆均價</div>'
-                f'<div class="v" style="font-size:1.05rem">{avg_txt}</div>'
-                f"</div>"
-            ))
-
-
-def page_search():
-    inject_hero(
-        "搜尋航班",
-        "設定航線與行程條件，快速比較可用票價",
-        ["多來源票價", "價格比較", "目標價監控"],
-        kicker="FLIGHT SEARCH",
-    )
-    inject_cmd_bar(
-        api_ok=flight_api_ready(),
-        channels=configured_channels(),
-        cooldown_h=NOTIFY_COOLDOWN_HOURS,
-        extra="免費額度優先",
-    )
-
-    st.html('<div class="section-label">搜尋條件</div>')
-
-    # 交換機塲用 session 預設
-    if "origin_default" not in st.session_state:
-        st.session_state["origin_default"] = "TPE"
-    if "dest_default" not in st.session_state:
-        st.session_state["dest_default"] = "KIX"
-
-    st.html('<div class="form-shell">')
-    c1, c_swap, c2 = st.columns([1, 0.18, 1])
-    with c1:
-        origin = pick_airport("出發地", "origin", st.session_state["origin_default"])
-    with c_swap:
-        st.write("")
-        st.write("")
-        if st.button("⇄", help="交換出發/目的地", use_container_width=True, key="swap_airports"):
-            st.session_state["origin_default"], st.session_state["dest_default"] = (
-                st.session_state.get("dest_default", "KIX"),
-                st.session_state.get("origin_default", "TPE"),
-            )
-            # 清掉 select 狀態，讓預設生效
-            for k in list(st.session_state.keys()):
-                if k.startswith("origin_") or k.startswith("dest_"):
-                    if k not in ("origin_default", "dest_default"):
-                        del st.session_state[k]
-            st.rerun()
-    with c2:
-        destination = pick_airport("目的地", "dest", st.session_state["dest_default"])
-
-    # 記住目前選擇，方便下次交換
-    st.session_state["origin_default"] = origin
-    st.session_state["dest_default"] = destination
-
-    r1, r2, r3, r4, r5 = st.columns([1.2, 1.2, 1, 1, 1.2])
-    with r1:
-        trip_type = st.radio("行程類型", ["單程", "來回"], horizontal=True)
-    with r2:
-        outbound = st.date_input(
-            "出發日期",
-            value=date.today() + timedelta(days=30),
-            min_value=date.today(),
-        )
-    with r3:
-        if trip_type == "來回":
-            return_d = st.date_input(
-                "回程日期",
-                value=date.today() + timedelta(days=37),
-                min_value=outbound,
-            )
+    with outbox_tab:
+        st.caption("失敗項目會依退避策略自動重試；手動放回佇列不會立刻連線。")
+        if not outbox:
+            st.html(ui.empty_state("通知佇列是空的", "排程通知會先可靠寫入佇列，再嘗試外送。", icon="✓"))
         else:
-            return_d = None
-            st.write("")
-            st.caption("單程無需回程")
-    with r4:
-        adults = st.number_input("成人", min_value=1, max_value=9, value=1)
-    with r5:
-        travel_class_str = st.selectbox("艙等", ["經濟艙", "豪華經濟艙", "商務艙", "頭等艙"])
-        class_map = {"經濟艙": 1, "豪華經濟艙": 2, "商務艙": 3, "頭等艙": 4}
-        travel_class = class_map[travel_class_str]
-
-    st.write("")
-    search_btn = st.button("搜尋最佳機票", type="primary", use_container_width=True)
-    st.html("</div>")
-
-    if search_btn:
-        if origin == destination:
-            st.error("出發地與目的地不可相同")
-            return
-        with st.spinner("正在向票價資料來源查詢價格…"):
-            try:
-                result = search_and_save(
-                    origin=origin,
-                    destination=destination,
-                    outbound_date=outbound.isoformat(),
-                    return_date=return_d.isoformat() if return_d else None,
-                    adults=int(adults),
-                    travel_class=travel_class,
-                )
-                st.session_state["last_result"] = result
-                st.session_state["last_adults"] = int(adults)
-                st.session_state["last_market_reference"] = None
-                if travelpayouts_ready() and int(adults) == 1 and travel_class == 1:
+            outbox_statuses = sorted({str(item.get("status") or "unknown") for item in outbox})
+            status_filter = st.multiselect(
+                "篩選佇列狀態",
+                outbox_statuses,
+                default=outbox_statuses,
+                format_func=lambda status: _localized_status(status, OUTBOX_STATUS_LABELS),
+                key="outbox_filter",
+            )
+            shown_outbox = [item for item in outbox if str(item.get("status") or "unknown") in status_filter]
+            out_rows = [
+                {
+                    "建立時間": _format_datetime(item.get("created_at")),
+                    "管道": item.get("channel") or "—",
+                    "狀態": _localized_status(item.get("status"), OUTBOX_STATUS_LABELS),
+                    "嘗試": f"{int(item.get('attempt_count') or 0)} / {int(item.get('max_attempts') or 0)}",
+                    "下次嘗試": _format_datetime(item.get("next_attempt_at")),
+                    "錯誤": item.get("last_error") or "—",
+                    "監控": item.get("monitor_id") or "—",
+                    "ID": item.get("id"),
+                }
+                for item in shown_outbox
+            ]
+            st.dataframe(pd.DataFrame(out_rows), hide_index=True, use_container_width=True)
+            retryable = [item for item in outbox if item.get("status") in {"failed", "retry"}]
+            if retryable:
+                retry_map = {
+                    f"#{item['id']} · {item.get('channel')} · {str(item.get('last_error') or '等待重試')[:80]}": item
+                    for item in retryable
+                }
+                selected_retry = retry_map[st.selectbox("選擇要重新排隊的通知", list(retry_map), key="retry_outbox_item")]
+                if st.button("重設嘗試次數並放回佇列", use_container_width=True):
                     try:
-                        st.session_state["last_market_reference"] = get_market_reference(
-                            origin=origin,
-                            destination=destination,
-                            outbound_date=outbound.isoformat(),
-                            return_date=return_d.isoformat() if return_d else None,
-                        )
-                    except TravelpayoutsError as market_error:
-                        st.session_state["last_market_reference"] = {
-                            "available": False,
-                            "error": str(market_error),
-                        }
-                elif travelpayouts_ready():
-                    st.session_state["last_market_reference"] = {
-                        "available": False,
-                        "unsupported_fare_basis": True,
-                    }
-            except FlightAPIError as e:
-                st.error(f"查詢失敗：{e}")
-                return
-            except Exception as e:
-                st.error(f"發生錯誤：{e}")
-                return
+                        db.retry_outbox_delivery(int(selected_retry["id"]))
+                        st.success("已放回重試佇列；排程器會在下一個處理週期外送。")
+                        st.rerun()
+                    except (TypeError, ValueError) as exc:
+                        st.error(f"無法重試：{exc}")
+            st.divider()
+            st.warning("「立即處理」可能馬上向 Telegram／Discord 外送佇列中的訊息。")
+            process_confirm = st.checkbox("我確認要立即外送目前到期的通知", key="process_outbox_confirm")
+            if st.button("立即處理到期通知", disabled=not process_confirm, type="primary", use_container_width=True):
+                try:
+                    with st.spinner("正在處理通知佇列…"):
+                        results = process_notification_outbox(limit=50)
+                    succeeded = sum(bool(item.get("success")) for item in results)
+                    st.success(f"已處理 {len(results)} 筆，其中 {succeeded} 筆成功。")
+                    if results:
+                        st.dataframe(pd.DataFrame(results), hide_index=True, use_container_width=True)
+                except Exception as exc:
+                    st.error(f"通知處理失敗：{exc}")
 
-    result = st.session_state.get("last_result")
-    if not result:
-        st.html(
-            (
-                '<div class="empty-state">'
-                '<div class="icon">🛫</div>'
-                '<div style="font-weight:600;color:#64748b;margin-bottom:0.3rem">尚未查詢</div>'
-                "<div>選擇航線與日期，按下搜尋即可取得即時企業級報價</div>"
-                "</div>"
-            ))
-        return
-
-    best = result.get("best_price")
-    flights = result.get("flights") or []
-    o, d = result["origin"], result["destination"]
-    o_label = get_label(o)
-    d_label = get_label(d)
-    date_txt = result["outbound_date"]
-    if result.get("return_date"):
-        date_txt += f"  →  {result['return_date']}"
-    adults_saved = int(result.get("adults") or st.session_state.get("last_adults") or adults)
-    travel_class_saved = int(result.get("travel_class") or 1)
-    travel_class_name = {1: "經濟艙", 2: "豪華經濟艙", 3: "商務艙", 4: "頭等艙"}.get(
-        travel_class_saved, "經濟艙"
-    )
-
-    # 價格洞察
-    insight = db.get_route_price_stats(
-        result["route_id"],
-        outbound_date=result["outbound_date"],
-        return_date=result.get("return_date"),
-    )
-
-    st.html('<div class="section-label">查詢結果</div>')
-
-    left, right = st.columns([1.12, 1.88])
-    with left:
-        price_display = f"{best:,.0f}" if best is not None else "—"
-        st.html(
-            f'<div class="deal-price-card">'
-            f'<div class="deal-price-label">目前最低價</div>'
-            f'<div class="deal-price-value">'
-            f'<span>TWD</span><strong>{price_display}</strong>'
-            f'</div>'
-            f'<div class="deal-price-route">{_safe(o)} → {_safe(d)} · {_safe(date_txt)}</div>'
-            f'<div class="deal-price-meta">{adults_saved} 位成人 · {_safe(travel_class_name)}</div>'
-            f'</div>'
-        )
-        render_price_insight(insight, best)
-        market_reference = st.session_state.get("last_market_reference")
-        st.html('<div class="section-label">市場趨勢參考</div>')
-        if not travelpayouts_ready():
-            st.caption("Travelpayouts Data API 未設定；目前僅顯示 SerpAPI 即時報價。")
-        elif market_reference and market_reference.get("error"):
-            st.warning(f"趨勢資料暫時無法取得：{market_reference['error']}")
-        elif market_reference and market_reference.get("unsupported_fare_basis"):
-            st.caption("為避免錯誤比價，快取趨勢只顯示於 1 位成人、經濟艙的搜尋。")
-        elif not market_reference or not market_reference.get("available"):
-            st.caption("Travelpayouts 快取中沒有這條航線／月份的可用觀察值。")
+    with log_tab:
+        if not notifications:
+            st.html(ui.empty_state("尚無外送紀錄", "成功、失敗與本機備援紀錄都會保留。", icon="↗"))
         else:
-            reference_price = float(market_reference["price"])
-            reference_label = (
-                "同日快取觀察價"
-                if market_reference.get("match") == "exact_date"
-                else "本月快取低價"
-            )
-            price_gap = float(best) - reference_price if best is not None else None
-            market_col1, market_col2 = st.columns(2)
-            market_col1.metric(reference_label, f"NT$ {reference_price:,.0f}")
-            market_col2.metric(
-                "即時價相對差額",
-                f"NT$ {price_gap:+,.0f}" if price_gap is not None else "—",
-            )
-            st.caption(
-                f"觀察日期 {market_reference['departure_date']} · "
-                f"樣本 {market_reference['observations']} 筆 · 快取資料，不能視為目前可購買價格"
-            )
-        st.html(
-            (
-                f'<div class="stat-grid">'
-                f'<div class="stat-card"><div class="k">航班</div><div class="v">{len(flights)}</div></div>'
-                f'<div class="stat-card"><div class="k">出發</div><div class="v" style="font-size:1rem">{o}</div></div>'
-                f'<div class="stat-card"><div class="k">抵達</div><div class="v" style="font-size:1rem">{d}</div></div>'
-                f"</div>"
-            ))
-        st.caption(f"{o_label}")
-        st.caption(f"{d_label}")
+            log_rows = [
+                {
+                    "時間": _format_datetime(item.get("created_at")),
+                    "管道": item.get("channel") or "—",
+                    "結果": "成功" if item.get("success") else "失敗",
+                    "監控": item.get("monitor_id") or "—",
+                    "訊息摘要": str(item.get("message") or "").replace("\n", " ")[:160],
+                }
+                for item in notifications
+            ]
+            st.dataframe(pd.DataFrame(log_rows), hide_index=True, use_container_width=True)
 
-        # Google Flights 快速連結
-        gf_url = f"https://www.google.com/travel/flights?q=Flights+to+{d}+from+{o}+on+{result['outbound_date']}"
-        if result.get("return_date"):
-            gf_url += f"+returning+{result['return_date']}"
-        st.html(
-            f'<a href="{gf_url}" target="_blank" class="gf-link">'
-            f'✈️ 在 Google Flights 查看並訂購</a>')
-        st.write("")
 
-        st.html('<div class="section-label">建立價格監控</div>')
-        default_target = int(best * 0.9) if best else 5000
-        target = st.number_input(
-            "目標價格（低於此價通知）",
-            min_value=100,
-            max_value=500000,
-            value=default_target,
-            step=100,
+def page_settings() -> None:
+    health = get_scheduler_health()
+    usage = quota_summaries()[0]
+    monitors = db.list_monitors(active_only=True)
+    _page_header(
+        "系統設定",
+        "唯讀檢視目前環境、排程與 Telegram 指令安全設定。",
+        eyebrow="SYSTEM",
+        badges=[{"text": "環境變更需重啟", "tone": "warning"}],
+    )
+    st.html(
+        ui.status_banner(
+            "此頁不會直接寫入 .env",
+            "金鑰與整合設定由本機環境管理；修改後請重新啟動 Streamlit、scheduler 與 telegram_bot。",
+            status="info",
+            label="唯讀",
         )
-        if st.button("加入監控", use_container_width=True):
-            res = db.add_monitor(
-                route_id=result["route_id"],
-                outbound_date=result["outbound_date"],
-                return_date=result.get("return_date"),
-                target_price=float(target),
-                adults=adults_saved,
-                travel_class=travel_class_saved,
-                trip_type="round_trip" if result.get("return_date") else "one_way",
-            )
-            mid = res["id"]
-            if res.get("duplicate"):
-                st.info(f"已有相同監控 #{mid}，已更新目標價為 NT$ {target:,.0f}")
-            else:
-                st.success(f"已加入監控 #{mid} · 目標 NT$ {target:,.0f}")
-
-    with right:
-        st.html('<div class="section-label">航班選項</div>')
-        f1, f2, f3 = st.columns([1, 1, 1.2])
-        with f1:
-            direct_only = st.checkbox("只看直飛", value=False)
-        with f2:
-            max_stops = st.selectbox("最多轉機", [0, 1, 2, 3], index=2, disabled=direct_only)
-        with f3:
-            sort_by = st.selectbox(
-                "排序",
-                ["價格由低到高", "直飛優先", "時長由短到長", "出發時間"],
-                index=0,
-            )
-
-        shown = _filter_sort_flights(
-            flights,
-            direct_only=direct_only,
-            max_stops=int(max_stops),
-            sort_by=sort_by,
+    )
+    service_tab, quota_tab, telegram_tab, maintenance_tab = st.tabs(["服務狀態", "額度規劃", "Telegram 指令", "維護工具"])
+    with service_tab:
+        cards = [
+            ("SerpAPI 即時查價", "已設定" if flight_api_ready() else "未設定", flight_api_ready(), "SERPAPI_API_KEY"),
+            ("Travelpayouts 月曆", "已設定" if travelpayouts_ready() else "未設定", travelpayouts_ready(), "TRAVELPAYOUTS_TOKEN"),
+            ("排程器", "正常" if health["healthy"] else "未回報", health["healthy"], _format_datetime(health["updated_at"])),
+            ("Telegram Bot", "已設定" if TELEGRAM_BOT_TOKEN else "未設定", bool(TELEGRAM_BOT_TOKEN), "不顯示 Token"),
+        ]
+        cols = st.columns(2)
+        for index, (label, value, ok, description) in enumerate(cards):
+            with cols[index % 2]:
+                st.html(ui.status_card(label, value, description=description, status="success" if ok else "warning"))
+        st.markdown("**排程器執行狀態**")
+        st.json(
+            {
+                "狀態": health["state"],
+                "監督器": health["supervisor_state"],
+                "最近完成": _format_datetime(health["last_run"]),
+                "下次執行": _format_datetime(health["next_run"]),
+                "漏跑回溯": f"{MISSED_RUN_LOOKBACK_HOURS} 小時",
+                "最近錯誤": health["last_error"] or None,
+            },
+            expanded=False,
         )
-        st.caption(f"顯示 {len(shown)} / {len(flights)} 個選項")
+        st.code("start_skywatch.bat\nstart_scheduler.bat\nstart_telegram_bot.bat", language="text")
+        st.caption("環境變數變更後，請關閉舊程序並重新執行對應啟動檔。")
 
-        if not shown:
-            st.info("沒有符合篩選條件的航班，請放寬條件")
+    with quota_tab:
+        if usage["limit"]:
+            st.html(ui.quota_meter(usage["attempted"], usage["limit"], label="SerpAPI 本月嘗試次數", reset_at="下個月"))
         else:
-            for i, f in enumerate(shown[:12]):
-                render_flight_card(f, rank=i)
-
-
-def page_history():
-    inject_hero(
-        "價格歷史",
-        "用歷史資料判斷目前價格所處區間",
-        ["航線比較", "價格區間", "CSV 匯出"],
-        kicker="PRICE INTELLIGENCE",
-    )
-
-    routes = db.list_routes()
-    if not routes:
-        st.html(
-            '<div class="empty-state"><div class="icon">📈</div><div>尚無歷史資料，請先查價一次</div></div>')
-        return
-
-    route_map = {
-        f"{r['origin']} → {r['destination']}  ·  {r.get('origin_name', '')}": r for r in routes
-    }
-
-    # 支援多航線比較
-    selected_labels = st.multiselect("航線（可多選比較）", list(route_map.keys()), default=[list(route_map.keys())[0]])
-    if not selected_labels:
-        st.info("請選擇至少一條航線")
-        return
-    selected_routes = [route_map[l] for l in selected_labels]
-
-    all_data = []
-    for route in selected_routes:
-        with db.get_db() as conn:
-            rows = conn.execute(
-                "SELECT * FROM price_history WHERE route_id=? ORDER BY recorded_at ASC",
-                (route["id"],),
-            ).fetchall()
-        for r in rows:
-            d = dict(r)
-            d["_route_label"] = f"{route['origin']}→{route['destination']}"
-            all_data.append(d)
-
-    if not all_data:
-        st.warning("所選航線尚無價格紀錄")
-        return
-
-    df = pd.DataFrame(all_data)
-    df["recorded_at"] = pd.to_datetime(df["recorded_at"])
-    df["label"] = df["_route_label"] + " · " + df["outbound_date"] + df["return_date"].fillna("").apply(
-        lambda x: f" / {x}" if x else ""
-    )
-
-    dates = sorted(df["outbound_date"].unique().tolist())
-    selected = st.multiselect("篩選出發日", dates, default=dates[-min(5, len(dates)) :])
-    if selected:
-        df = df[df["outbound_date"].isin(selected)]
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("紀錄筆數", f"{len(df)}")
-    m2.metric("最低價", f"NT$ {df['price'].min():,.0f}")
-    m3.metric("最高價", f"NT$ {df['price'].max():,.0f}")
-    m4.metric("平均價", f"NT$ {df['price'].mean():,.0f}")
-
-    def render_gf_insight(current_price: float, min_p: float, max_p: float, avg_p: float):
-        if current_price < avg_p * 0.95:
-            level_txt = "較低價位"
-            pos_pct = 15
-        elif current_price > avg_p * 1.05:
-            level_txt = "較高價位"
-            pos_pct = 85
-        else:
-            level_txt = "一般價位"
-            pos_pct = 50
-
-        low_bound = int((min_p + avg_p) / 2)
-        high_bound = int((avg_p + max_p) / 2)
-        if low_bound == high_bound:
-            low_bound = int(min_p)
-            high_bound = int(max_p)
-
-        st.html(f"""
-        <div class="price-insight">
-            <div class="price-insight-eyebrow">目前價格定位</div>
-            <div class="price-insight-title">NT$ {current_price:,.0f} <span>{level_txt}</span></div>
-            <div class="price-insight-copy">歷史常見區間約為 NT$ {low_bound:,.0f}－{high_bound:,.0f}</div>
-            <div class="price-range">
-                <div class="price-range-low"></div>
-                <div class="price-range-mid"></div>
-                <div class="price-range-high"></div>
-                <div class="price-range-marker" style="left:{pos_pct}%">
-                    <div class="price-range-dot"></div>
-                </div>
-            </div>
-            <div class="price-range-labels"><span>偏低</span><span>一般</span><span>偏高</span></div>
-        </div>
-        """)
-
-    if len(selected_routes) == 1 and len(df) > 0:
-        render_gf_insight(df['price'].iloc[-1], df['price'].min(), df['price'].max(), df['price'].mean())
-
-    st.html('<div class="section-label">價格變化</div>')
-
-    fig = go.Figure()
-    palette = ["#087443", "#287d78", "#5f6d66", "#b7791f", "#7a4f87"]
-    grouped = list(df.groupby("label"))
-    for index, (name, g) in enumerate(grouped):
-        color = palette[index % len(palette)]
-        fig.add_trace(
-            go.Scatter(
-                x=g["recorded_at"],
-                y=g["price"],
-                mode="lines+markers",
-                name=str(name),
-                line=dict(width=2.6, color=color),
-                marker=dict(size=6, color=color, line=dict(width=2, color="#ffffff")),
-                fill="tozeroy" if len(grouped) == 1 else None,
-                fillcolor="rgba(37, 99, 235, 0.08)",
-                hoverinfo="x+y+name",
+            st.info(f"本月已嘗試 {usage['attempted']} 次；SERPAPI_MONTHLY_LIMIT 目前為 0（未知上限）。")
+        st.markdown("**三種額度模式試算**")
+        baseline_runs = max(0.1, scheduled_runs_per_day())
+        monitor_count = max(1, len(monitors))
+        rows = []
+        for mode in QUOTA_LABELS:
+            policy = QuotaPolicy(mode=mode, monthly_limit=SERPAPI_MONTHLY_LIMIT)
+            forecast = policy.forecast(baseline_runs, monitor_count, used_requests=int(usage["attempted"]))
+            rows.append(
+                {
+                    "模式": QUOTA_LABELS[mode],
+                    "單次最多請求": policy.max_requests_per_run,
+                    "每日預估": forecast.daily_requests,
+                    "每月預估": forecast.monthly_requests,
+                    "額度足夠": "未知" if forecast.fits_monthly_limit is None else "是" if forecast.fits_monthly_limit else "否",
+                }
             )
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        total_projection = sum(
+            _quota_forecast(str(item.get("quota_mode") or "full"), _monitor_runs_per_day(item))["monthly_requests"]
+            for item in monitors
         )
+        if usage["remaining"] is not None and total_projection > usage["remaining"]:
+            st.warning(f"現有監控最多約需 {total_projection:,} 次，超過本月剩餘 {usage['remaining']:,} 次。建議降低頻率或改用精簡模式。")
+        else:
+            st.success(f"依目前策略粗估，每月最多約 {total_projection:,} 次供應商請求。")
 
-    xaxis_opts = dict(gridcolor="rgba(0,0,0,0)", title="", color="#64748b", showline=True, linewidth=1, linecolor="#dbe4ee", tickformat="%m-%d %H:%M")
-    yaxis_opts = dict(gridcolor="#e7edf5", title="", color="#64748b", rangemode="tozero", tickprefix="NT$ ", showline=False, zeroline=False)
-
-    if len(df) == 1:
-        single_date = df["recorded_at"].iloc[0]
-        xaxis_opts["range"] = [single_date - pd.Timedelta(hours=12), single_date + pd.Timedelta(hours=12)]
-
-    fig.update_layout(
-        template="plotly_white",
-        paper_bgcolor="#ffffff",
-        plot_bgcolor="#ffffff",
-        height=360,
-        margin=dict(l=10, r=10, t=22, b=10),
-        showlegend=len(grouped) > 1,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        xaxis=xaxis_opts,
-        yaxis=yaxis_opts,
-        font=dict(family="Inter, 'Noto Sans TC', sans-serif", color="#475569"),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.html('<div class="section-label">明細紀錄</div>')
-    show = df[
-        ["recorded_at", "_route_label", "outbound_date", "return_date", "price", "airline", "stops", "duration"]
-    ].sort_values("recorded_at", ascending=False)
-    show.columns = ["記錄時間", "航線", "出發日", "回程日", "價格", "航空", "轉機", "時長"]
-    st.dataframe(show, use_container_width=True, hide_index=True)
-
-    # CSV 匯出
-    csv_data = show.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        "📥 匯出 CSV",
-        data=csv_data,
-        file_name=f"skywatch_price_history_{datetime.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv",
-    )
-
-
-def page_monitors():
-    inject_hero(
-        "監控管理",
-        "管理目標價、啟用狀態與通知結果",
-        ["目標價", "排程查價", "通知追蹤"],
-        kicker="MONITORING",
-    )
-    inject_cmd_bar(
-        api_ok=flight_api_ready(),
-        channels=configured_channels(),
-        cooldown_h=NOTIFY_COOLDOWN_HOURS,
-        extra="LIVE CHECK",
-    )
-
-    c1, c2 = st.columns([1, 3])
-    with c1:
-        if st.button("立即檢查全部", type="primary", use_container_width=True):
-            with st.spinner("檢查中（會呼叫 SerpAPI）…"):
-                st.session_state["check_results"] = check_all_monitors()
-
-    # 自動停用已過出發日的監控
-    expired_count = db.expire_monitors()
-    if expired_count:
-        st.info(f"已自動停用 {expired_count} 筆過期監控（出發日已過）")
-
-    monitors = db.list_monitors(active_only=False)
-    if not monitors:
-        st.html(
-            '<div class="empty-state"><div class="icon">🔔</div><div>尚無監控。查價後可設定目標價加入。</div></div>')
-    else:
-        st.html('<div class="section-label">監控清單</div>')
-        for m in monitors:
-            active = bool(m.get("active"))
-            cls = "mon-active" if active else "mon-inactive"
-            trip = m["outbound_date"]
-            if m.get("return_date"):
-                trip += f"  ⇄  {m['return_date']}"
-            last_p = m.get("last_price")
-            last_price_txt = f"NT$ {last_p:,.0f}" if last_p else "尚未檢查"
-            status = "啟用中" if active else "已停用"
-            hit = last_p is not None and last_p <= (m.get("target_price") or 0)
-            if hit:
-                cls = "mon-hit"
-
-            active_chip = "green" if active else "amber"
-            st.html(
-                (
-                    f'<div class="mon-card {cls}">'
-                    f'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;flex-wrap:wrap">'
-                    f"<div>"
-                    f'<div style="font-weight:700;font-size:1.05rem;color:#1e293b">#{m["id"]}  {m["origin"]} → {m["destination"]}</div>'
-                    f'<div style="color:#64748b;font-size:0.85rem;margin-top:0.25rem">{trip}</div>'
-                    f'<div style="margin-top:0.55rem">'
-                    f'<span class="chip">目標 ≤ NT$ {m["target_price"]:,.0f}</span>'
-                    f'<span class="chip {active_chip}">{status}</span>'
-                    f"</div></div>"
-                    f'<div style="text-align:right">'
-                    f'<div style="color:#64748b;font-size:0.75rem">上次價格</div>'
-                    f'<div style="font-weight:700;color:#087443;font-size:1.2rem">{last_price_txt}</div>'
-                    f'<div style="color:#94a3b8;font-size:0.72rem">{m.get("last_checked") or "—"}</div>'
-                    f"</div></div></div>"
-                ))
-            b1, b2, b3, b4 = st.columns([1, 1, 1.15, 1.15])
-            confirm_key = f"confirm_delete_{m['id']}"
-            with b1:
-                if st.button("檢查", key=f"chk_{m['id']}", use_container_width=True):
-                    with st.spinner("查詢中…"):
-                        r = check_one_monitor(m)
-                    if r.get("ok"):
-                        if r.get("best_price") is not None:
-                            st.success(f"目前最低 NT$ {r['best_price']:,.0f}")
-                        else:
-                            st.info("查無價格")
-                        if r.get("hit"):
-                            if r.get("skipped_notify"):
-                                st.info("已達目標價；同一瞬間的重複通知已略過")
-                            elif r.get("notified"):
-                                st.warning("已達目標價，已發送通知")
-                            else:
-                                st.warning("已達目標價（通知可能失敗，請看通知紀錄）")
-                        elif r.get("notified"):
-                            st.success("本次報價已發送通知")
-                        elif r.get("notify_reason") in ("cooldown", "deduplicated"):
-                            st.info("已完成查價；防重複機制略過本次通知")
-                    else:
-                        st.error(r.get("error"))
-            with b2:
-                if active:
-                    if st.button("停用", key=f"off_{m['id']}", use_container_width=True):
-                        db.set_monitor_active(m["id"], False)
-                        st.rerun()
-                else:
-                    if st.button("啟用", key=f"on_{m['id']}", use_container_width=True):
-                        db.set_monitor_active(m["id"], True)
-                        st.rerun()
-            with b3:
-                if not st.session_state.get(confirm_key):
-                    if st.button("刪除", key=f"del_{m['id']}", use_container_width=True):
-                        st.session_state[confirm_key] = True
-                        st.rerun()
-                elif st.button("確認刪除", key=f"del_ok_{m['id']}", use_container_width=True, type="primary"):
-                    db.delete_monitor(m["id"])
-                    st.session_state.pop(confirm_key, None)
-                    st.rerun()
-            with b4:
-                if st.session_state.get(confirm_key):
-                    if st.button("取消", key=f"del_cancel_{m['id']}", use_container_width=True):
-                        st.session_state.pop(confirm_key, None)
-                        st.rerun()
-
-    if st.session_state.get("check_results"):
-        st.html('<div class="section-label">最近一次批次結果</div>')
-        for r in st.session_state["check_results"]:
-            if not r.get("ok"):
-                st.error(f"#{r['monitor_id']}: {r.get('error')}")
-            else:
-                if r.get("hit") and r.get("skipped_notify"):
-                    hit = "達標（冷卻去重，未重送）"
-                elif r.get("hit") and r.get("notified"):
-                    hit = "達標並通知"
-                elif r.get("hit"):
-                    hit = "達標（通知失敗或僅本機紀錄）"
-                elif r.get("notified"):
-                    hit = "未達標，已回報最新價格"
-                elif r.get("notify_reason") in ("cooldown", "deduplicated"):
-                    hit = "未達標（防重複略過通知）"
-                else:
-                    hit = "未達標"
-                st.write(
-                    f"#{r['monitor_id']} · 現價 {r.get('best_price')} / 目標 {r.get('target_price')} → {hit}"
-                )
-
-    st.markdown("---")
-    st.html('<div class="section-label">通知紀錄</div>')
-    notes = db.list_notifications(30)
-    if notes:
-        ndf = pd.DataFrame(notes)[["created_at", "channel", "success", "message"]]
-        ndf.columns = ["時間", "管道", "成功", "訊息"]
-        st.dataframe(ndf, use_container_width=True, hide_index=True)
-    else:
-        st.caption("尚無通知紀錄")
-
-
-def page_settings():
-    inject_hero(
-        "通知與系統設定",
-        "檢查資料來源、免費額度、通知策略與背景排程",
-        ["額度節省", "API 備援", "Telegram"],
-        kicker="SYSTEM",
-    )
-
-    active_monitors = db.list_monitors(active_only=True)
-    col1, col2 = st.columns(2)
-    with col1:
-        st.html('<div class="section-label">連線狀態</div>')
-        st.write(f"**SerpAPI：** {'已設定' if SERPAPI_API_KEY else '未設定'}")
-        st.write(f"**Travelpayouts 趨勢：** {'已設定' if travelpayouts_ready() else '未設定（可選）'}")
-        st.write("**查詢策略：** 主查詢 → 補最推薦與三大國籍航空回程 → 達標查開票平台")
-        st.write("**通知管道：** " + "、".join(configured_channels()))
+    with telegram_tab:
+        command_ready = bool(TELEGRAM_COMMANDS_ENABLED and TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS)
+        _metric_row(
+            [
+                {"label": "指令服務", "value": "可啟動" if command_ready else "設定未完整", "tone": "success" if command_ready else "warning"},
+                {"label": "允許的 Chat ID", "value": len(TELEGRAM_ALLOWED_CHAT_IDS), "caption": "僅顯示數量", "tone": "primary"},
+                {"label": "指令", "value": "3", "caption": "/status · /quota · /check", "tone": "info"},
+            ]
+        )
         st.markdown(
-            f"""
-            在專案 `.env` 設定：
-
-            ```env
-            SERPAPI_API_KEY=...
-            TRAVELPAYOUTS_TOKEN=...
-            DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
-            TELEGRAM_BOT_TOKEN=...
-            TELEGRAM_CHAT_ID=...
-            ALWAYS_NOTIFY={'true' if ALWAYS_NOTIFY else 'false'}
-            NOTIFY_COOLDOWN_HOURS={NOTIFY_COOLDOWN_HOURS:g}
-            ```
-
-            目前策略：**{'每次查價均通知' if ALWAYS_NOTIFY else '僅達標或價格變動時通知'}**
-            固定回報：**每日 00:00 / 12:00 必送**
-            手動冷卻：**{NOTIFY_COOLDOWN_HOURS:g} 小時**
-            詳細補查：**{'固定報告補最推薦與國籍航空回程；達標後查開票平台' if MONITOR_FETCH_DETAILS_ON_HIT else '停用'}**
+            """
+            - `/status`：查看排程器健康、最近完成與下一次執行。
+            - `/quota`：查看 SerpAPI 本月用量與剩餘額度。
+            - `/check`：先取得短效一次性確認碼，再確認執行手動查價。
             """
         )
-    with col2:
-        st.html('<div class="section-label">測試通知</div>')
-        msg = st.text_input("訊息內容", value="SkyWatch 測試通知 · 機票監控系統運作正常")
-        if st.button("發送測試", type="primary", use_container_width=True):
-            for ch, ok, detail in send_all(msg):
-                if ok:
-                    st.success(f"{ch} · 成功")
-                else:
-                    st.error(f"{ch} · 失敗 — {detail}")
+        if not TELEGRAM_COMMANDS_ENABLED:
+            st.warning("TELEGRAM_COMMANDS_ENABLED 已關閉。")
+        if not TELEGRAM_ALLOWED_CHAT_IDS:
+            st.warning("尚未設定 TELEGRAM_ALLOWED_CHAT_IDS 或 TELEGRAM_CHAT_ID；所有指令都會被拒絕。")
+        st.caption("安全設計：Chat ID 採允許清單；/check 確認碼短效、一次性且可防止重播。")
 
-    st.html('<div class="section-label">API 免費額度</div>')
-    summaries = quota_summaries()
-    serp_summary = summaries[0]
-    estimated_primary = estimate_monthly_primary_searches(len(active_monitors))
-    round_trip_monitors = sum(1 for monitor in active_monitors if monitor.get("return_date"))
-    estimated_return_details_max = estimate_monthly_primary_searches(round_trip_monitors) * 4
-    estimated_monthly = estimated_primary + estimated_return_details_max
-    qc1, qc2, qc3, qc4 = st.columns(4)
-    qc1.metric(
-        "SerpAPI 本月",
-        f"{serp_summary['used']} / {serp_summary['limit'] or '—'}",
-        f"嘗試 {serp_summary['attempted']} 次",
-    )
-    qc2.metric(
-        "免費剩餘",
-        f"{serp_summary['remaining']} 次" if serp_summary["remaining"] is not None else "未設定",
-    )
-    qc3.metric(
-        "排程月預估上限",
-        f"{estimated_monthly} 次",
-        f"主查詢 {estimated_primary} + 回程最多 {estimated_return_details_max}",
-    )
-    usage_percent = serp_summary.get("percent") or 0.0
-    qc4.metric("額度狀態", "注意" if usage_percent >= API_USAGE_WARNING_PERCENT else "正常", f"{usage_percent:.0f}%")
-    if serp_summary["limit"]:
-        st.progress(min(1.0, usage_percent / 100.0), text=f"SerpAPI 免費額度已使用 {usage_percent:.1f}%")
-    if usage_percent >= API_USAGE_WARNING_PERCENT:
+    with maintenance_tab:
+        active = db.list_monitors(active_only=True)
+        estimated_calls = sum(QuotaPolicy(mode=str(item.get("quota_mode") or "full")).max_requests_per_run for item in active)
         st.warning(
-            f"SerpAPI 已超過 {API_USAGE_WARNING_PERCENT:g}% 警戒線；系統每月只推播一次額度警告。"
+            f"立即檢查全部可能使用最多 {estimated_calls} 次 SerpAPI 額度，"
+            "並可能依每筆策略外送 Telegram／Discord 通知。"
         )
-    elif estimated_monthly > (serp_summary["limit"] or 10**9):
-        st.info("目前排程的整月預估會超過免費額度；建議減少監控項目或改為每日一次。")
-    st.caption("統計只記錄成功請求與操作類型，不保存航線、日期、API key 或旅遊資料。")
+        manual_confirmation = st.text_input("輸入 CHECK ALL 確認", key="check_all_confirmation")
+        if st.button(
+            "立即檢查全部啟用監控",
+            type="primary",
+            use_container_width=True,
+            disabled=manual_confirmation != "CHECK ALL" or not active,
+        ):
+            try:
+                with st.spinner("正在逐筆查價…"):
+                    results = check_all_monitors(scheduled_report=False)
+                ok = sum(bool(item.get("ok")) for item in results)
+                st.success(f"已完成 {len(results)} 筆，其中 {ok} 筆成功。")
+                if results:
+                    summary = [
+                        {
+                            "監控": item.get("monitor_id") or "—",
+                            "結果": "成功" if item.get("ok") else "失敗",
+                            "最低價": _currency(item.get("best_price")),
+                            "達標": "是" if item.get("hit") else "否",
+                            "通知": item.get("notify_reason") or "—",
+                            "API 次數": int(item.get("api_calls") or 0),
+                            "錯誤": item.get("error") or "—",
+                        }
+                        for item in results
+                    ]
+                    st.dataframe(pd.DataFrame(summary), hide_index=True, use_container_width=True)
+            except Exception as exc:
+                st.error(f"批次檢查失敗：{exc}")
+        st.divider()
+        cleanup_days = int(st.number_input("保留最近幾天的價格歷史", min_value=30, max_value=3650, value=365, step=30))
+        cleanup_confirm = st.checkbox("我確認刪除超過保留期限的價格歷史", key="cleanup_confirm")
+        if st.button("清理舊價格紀錄", disabled=not cleanup_confirm, use_container_width=True):
+            try:
+                removed = db.cleanup_old_records(cleanup_days)
+                st.success(f"已移除 {removed} 筆舊價格紀錄。")
+            except Exception as exc:
+                st.error(f"清理失敗：{exc}")
 
-    st.html('<div class="section-label">獨立背景排程</div>')
-    scheduler_health = get_scheduler_health()
-    notification_health = get_notification_health()
-    sc1, sc2, sc3, sc4 = st.columns(4)
-    sc1.metric("排程健康", "正常" if scheduler_health["healthy"] else "待確認")
-    sc2.metric("監控項目", f"{len(active_monitors)} 個")
-    last_run = scheduler_health.get("last_run")
-    sc3.metric("最近完成", last_run.strftime("%m/%d %H:%M") if last_run else "—")
-    sc4.metric("最近 Telegram", notification_health["label"])
 
-    if not active_monitors:
-        st.info("尚無啟用中的監控項目，請先在「監控中心」設定目標價")
-    elif not scheduler_health["healthy"]:
-        st.warning("超過 14 小時沒有成功紀錄，請確認 start_scheduler_silent.vbs 是否仍在執行。")
-    else:
-        st.success("獨立排程運作正常 · 每日 00:00 與 12:00 自動查價")
-    next_run = scheduler_health.get("next_run")
-    if notification_health["sent_today"]:
-        st.info(f"今天已有成功通知：{notification_health['label']}。")
-    elif notification_health.get("latest"):
-        st.warning(f"今天尚無成功通知；最近一次為 {notification_health['label']}。")
-    if scheduler_health.get("last_error"):
-        st.error(f"最近排程錯誤：{scheduler_health['last_error']}")
-    st.caption(
-        "下一次預定執行："
-        + (next_run.strftime("%m/%d %H:%M") if next_run else "待確認")
-        + " · 網頁程序不啟動第二套排程；完全相同的報價內容也會依管道防重。"
+def page_backup_restore() -> None:
+    _page_header(
+        "備份與復原",
+        "匯出監控規則或完整應用資料，並以驗證、預覽與復原點降低操作風險。",
+        eyebrow="DATA SAFETY",
+        badges=[{"text": "不含任何憑證", "tone": "success"}, {"text": "復原前自動快照", "tone": "info"}],
     )
-
-    st.html('<div class="section-label">通知設定教學</div>')
-    t1, t2 = st.columns(2)
-    with t1:
-        st.markdown(
-            """
-            **Discord**
-            1. 伺服器設定 → 整合 → Webhooks
-            2. 新增 Webhook，複製 URL
-            3. 貼到 `.env` 的 `DISCORD_WEBHOOK_URL`
-            """
+    st.html(
+        ui.status_banner(
+            "備份不包含任何憑證或整合設定",
+            "完整備份包含應用資料庫與監控規則；不包含 .env、API Key、Telegram Token 或其他整合設定。",
+            status="success",
+            label="安全範圍",
         )
-    with t2:
-        st.markdown(
-            """
-            **Telegram**
-            1. 找 @BotFather 建立 bot
-            2. 傳訊息給 bot
-            3. 用 getUpdates 查 `chat_id`
-            4. 填入 token 與 chat_id
-            """
-        )
-
-    # ═══ 資料庫維護 ═══
-    st.html('<div class="section-label">資料維護與匯出</div>')
-    from src.config import DB_PATH
-    import os
-    db_size = os.path.getsize(DB_PATH) if DB_PATH.exists() else 0
-    db_mb = db_size / (1024 * 1024)
-
-    col_db, col_export = st.columns(2)
-
-    with col_db:
-        with st.container(border=True):
-            st.markdown("#### 資料庫清理")
-            st.caption("管理價格歷史資料，不影響監控任務設定。")
-            sub1, sub2 = st.columns([1, 1.2])
-            with sub1:
-                st.metric("資料庫大小", f"{db_mb:.2f} MB")
-            with sub2:
-                cleanup_days = st.number_input(
-                    "保留最近天數", min_value=7, max_value=365, value=90, step=30
-                )
-
-            confirm_cleanup = st.checkbox(
-                f"確認刪除 {cleanup_days} 天前的價格紀錄",
-                key="confirm_cleanup_history",
-            )
-            if st.button("清理舊紀錄", use_container_width=True, disabled=not confirm_cleanup):
-                deleted = db.cleanup_old_records(days=cleanup_days)
-                st.success(f"已清理 {deleted} 筆舊價格紀錄")
-
-    with col_export:
-        with st.container(border=True):
-            st.markdown("#### 監控設定匯出")
-            st.caption("將航線、日期、目標價與啟用狀態匯出為 CSV 備份。")
-            monitors_export = db.list_monitors(active_only=False)
-            if monitors_export:
-                mdf = pd.DataFrame(monitors_export)
-                csv_m = mdf.to_csv(index=False).encode("utf-8-sig")
+    )
+    export_tab, import_tab, restore_tab = st.tabs(["匯出備份", "匯入監控", "完整復原"])
+    with export_tab:
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**監控規則 JSON**")
+            st.caption("適合跨環境搬移監控；不包含票價歷史與執行紀錄。")
+            if st.button("產生監控規則匯出", use_container_width=True):
+                path = Path(tempfile.gettempdir()) / f"skywatch-monitors-{_now().strftime('%Y%m%d-%H%M%S')}.json"
+                try:
+                    report = export_monitors(path, DB_PATH)
+                    st.session_state["monitor_export"] = {
+                        "bytes": path.read_bytes(),
+                        "name": path.name,
+                        "preview": report["preview"],
+                    }
+                except BackupError as exc:
+                    st.error(f"匯出失敗：{exc}")
+                finally:
+                    path.unlink(missing_ok=True)
+            monitor_export = st.session_state.get("monitor_export")
+            if monitor_export:
+                st.json(monitor_export["preview"], expanded=False)
                 st.download_button(
-                    "下載 CSV 備份",
-                    data=csv_m,
-                    file_name=f"skywatch_monitors_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
+                    "下載監控規則 JSON",
+                    data=monitor_export["bytes"],
+                    file_name=monitor_export["name"],
+                    mime="application/json",
                     use_container_width=True,
                 )
-            else:
-                st.caption("目前尚無監控資料可匯出")
+        with right:
+            st.markdown("**完整應用資料 ZIP**")
+            st.caption("包含資料庫、票價歷史、監控、執行與通知紀錄；不含任何憑證或整合設定。")
+            if st.button("產生完整備份", use_container_width=True):
+                path = Path(tempfile.gettempdir()) / f"skywatch-full-{_now().strftime('%Y%m%d-%H%M%S')}.zip"
+                try:
+                    report = create_full_backup(path, DB_PATH)
+                    st.session_state["full_export"] = {
+                        "bytes": path.read_bytes(),
+                        "name": path.name,
+                        "preview": report["preview"],
+                        "sha256": report["sha256"],
+                    }
+                except BackupError as exc:
+                    st.error(f"完整備份失敗：{exc}")
+                finally:
+                    path.unlink(missing_ok=True)
+            full_export = st.session_state.get("full_export")
+            if full_export:
+                st.json(full_export["preview"], expanded=False)
+                st.caption(f"SHA-256：{full_export['sha256']}")
+                st.download_button(
+                    "下載完整備份 ZIP",
+                    data=full_export["bytes"],
+                    file_name=full_export["name"],
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+
+    with import_tab:
+        st.caption("匯入前會驗證格式、預覽衝突，正式寫入前也會建立目前資料庫的復原點。")
+        monitor_upload = st.file_uploader("選擇監控規則 JSON", type=["json"], key="monitor_import_upload")
+        if monitor_upload:
+            path = _upload_to_temp(monitor_upload, ".json")
+            try:
+                preview = preview_monitor_import(path, DB_PATH)
+                st.success("檔案驗證通過。")
+                _metric_row(
+                    [
+                        {"label": "監控總數", "value": preview["monitor_count"], "tone": "primary"},
+                        {"label": "新增", "value": preview["new_count"], "tone": "success"},
+                        {"label": "衝突", "value": preview["conflict_count"], "tone": "warning"},
+                    ]
+                )
+                conflict = st.selectbox(
+                    "衝突處理",
+                    ["skip", "update", "duplicate"],
+                    format_func=lambda item: {"skip": "略過既有", "update": "更新既有", "duplicate": "保留重複副本"}[item],
+                )
+                confirm = st.text_input("輸入 IMPORT MONITORS 確認匯入", key="import_confirmation")
+                if st.button("匯入監控規則", type="primary", disabled=confirm != "IMPORT MONITORS", use_container_width=True):
+                    report = import_monitors(path, DB_PATH, conflict=conflict)
+                    st.success(
+                        f"匯入完成：新增 {report['created']}、更新 {report['updated']}、"
+                        f"略過 {report['skipped']}；已建立復原點。"
+                    )
+                    st.caption(f"復原點：{report['restore_point']}")
+            except (BackupError, BackupValidationError) as exc:
+                st.error(f"無法匯入：{exc}")
+            except Exception as exc:
+                st.error(f"匯入流程發生未預期錯誤：{exc}")
+            finally:
+                path.unlink(missing_ok=True)
+
+    with restore_tab:
+        st.error("完整復原會以備份資料庫取代目前資料。操作前請停止 scheduler 與 telegram_bot，完成後再重新啟動所有服務。")
+        backup_upload = st.file_uploader("選擇完整備份 ZIP", type=["zip"], key="full_restore_upload")
+        if backup_upload:
+            path = _upload_to_temp(backup_upload, ".zip")
+            try:
+                inspection = inspect_backup(path)
+                st.success("備份結構、允許清單與 SHA-256 驗證通過。")
+                st.json(
+                    {
+                        "建立時間": inspection.get("created_at"),
+                        "內容預覽": inspection.get("preview"),
+                        "檔案": inspection.get("members"),
+                    },
+                    expanded=False,
+                )
+                restore_confirm = st.text_input("輸入 RESTORE SKYWATCH 確認完整復原", key="restore_confirmation")
+                acknowledge = st.checkbox("我已停止排程器與 Telegram 指令服務", key="restore_stopped_services")
+                if st.button(
+                    "取代目前資料並建立復原點",
+                    type="primary",
+                    disabled=restore_confirm != "RESTORE SKYWATCH" or not acknowledge,
+                    use_container_width=True,
+                ):
+                    report = restore_full_backup(path, DB_PATH)
+                    db.init_db()
+                    st.success("完整復原成功。請重新啟動 Streamlit、scheduler 與 telegram_bot。")
+                    st.caption(f"復原前快照：{report['restore_point']}")
+            except (BackupError, BackupValidationError) as exc:
+                st.error(f"備份無法使用：{exc}")
+            except Exception as exc:
+                st.error(f"復原流程發生未預期錯誤：{exc}")
+            finally:
+                path.unlink(missing_ok=True)
 
 
-def page_help():
-    inject_hero(
+def page_help() -> None:
+    _page_header(
         "使用說明",
-        "從第一次查價到建立自動通知的完整流程",
-        ["快速開始", "功能說明", "常見問題"],
-        kicker="GUIDE",
+        "從第一次查價、建立策略到排程補跑與 Telegram 控制的完整指南。",
+        eyebrow="HELP",
+        badges=[{"text": "繁體中文", "tone": "primary"}, {"text": "操作導向", "tone": "info"}],
     )
+    st.html(ui.stepper(["即時查價", "建立策略", "自動執行", "通知與追蹤"], current=0, label="建議操作流程"))
+    sections = [
+        (
+            "1. 如何開始監控？",
+            "到「搜尋與比較」選擇航線、日期、人數與艙等。確認 1 次 SerpAPI 額度成本後查價，再設定一般目標價、額度模式、航空條件、排程和通知策略。",
+        ),
+        (
+            "2. 精簡、標準、完整有什麼差別？",
+            "三種模式分別限制單次監控最多 1、2、5 個供應商請求。精簡適合大量監控；完整可取得更多回程或開票細節。實際用量仍以執行紀錄為準。",
+        ),
+        (
+            "3. 為什麼月曆價格不能直接通知？",
+            "Travelpayouts Data API 是快取市場趨勢，不保證目前可購買。必須選定日期並使用 SerpAPI 即時驗證後，才能成為歷史資料或監控依據。",
+        ),
+        (
+            "4. 漏跑如何處理？",
+            f"排程器持續寫入 heartbeat，並檢查最近 {MISSED_RUN_LOOKBACK_HOURS} 小時的排程槽。偵測漏跑時最多補最近一個槽，且利用執行帳本避免同一槽重複執行。",
+        ),
+        (
+            "5. 為什麼 Telegram 不會重複送相同訊息？",
+            "通知會先寫入可靠佇列，再以唯一鍵防止相同管道、監控與執行內容重複入列；失敗則保留錯誤與退避重試時間。",
+        ),
+        (
+            "6. Telegram 可以輸入哪些指令？",
+            "/status 查看排程健康、/quota 查看額度、/check 以短效一次性確認碼啟動查價。只有允許清單內的 Chat ID 可以使用。",
+        ),
+        (
+            "7. 備份會包含金鑰嗎？",
+            "不會。完整備份包含應用資料庫與監控規則，但不包含 .env、API Key、Telegram Token 或任何整合設定。",
+        ),
+    ]
+    for title, body in sections:
+        with st.expander(title, expanded=title.startswith("1.")):
+            st.write(body)
+    st.info("所有時間均以 Asia/Taipei 顯示。若修改環境變數，請重新啟動對應服務。")
 
-    with st.expander("快速開始", expanded=True):
-        st.markdown(
-            """
-            1. 確認 `.env` 有 `SERPAPI_API_KEY`（到 [serpapi.com](https://serpapi.com) 註冊取得）
-            2. 安裝依賴：`.venv\\Scripts\\python.exe -m pip install -r requirements.txt`
-            3. 啟動：`start_skywatch.bat`
-            4. 瀏覽器開啟 `http://localhost:8501`
-            5. （可選）設定 Discord / Telegram 通知
-            6. （可選）`python scheduler.py` 背景監控
-            """
+
+def sidebar() -> str:
+    with st.sidebar:
+        st.markdown("# ✈️ SkyWatch")
+        st.caption(f"航班價格監控 · v{APP_VERSION}")
+        pages = [
+            "營運總覽",
+            "搜尋與比較",
+            "監控策略",
+            "價格情報",
+            "執行與通知",
+            "系統設定",
+            "備份與復原",
+            "使用說明",
+        ]
+        page = st.radio(
+            "主要功能",
+            pages,
+            key="main_page",
+            label_visibility="collapsed",
         )
-
-    with st.expander("功能一覽"):
-        st.markdown(
-            """
-            | 功能 | 說明 |
-            |------|------|
-            | 儀表板 | 營運狀態、達標數、最近查價一覽 |
-            | 搜尋航班 | 交換機場、篩選排序、價格洞察、碳排放顯示 |
-            | 價格歷史 | 多航線比較、價格區間、CSV 匯出 |
-            | 監控管理 | 目標價通知、防重複、冷卻去重、過期自動停用 |
-            | 通知與系統設定 | 背景排程、通知測試、資料清理與匯出 |
-            | 全球機場 | 約 8,800 個 IATA，支援中英文搜尋 |
-            """
-        )
-
-    with st.expander("常見問題"):
-        st.markdown(
-            """
-            **Q: SerpAPI 免費額度多少？**
-            > 免費方案目前每月 250 次成功查詢。SkyWatch 會統計用量，達 80% 時只提醒一次。
-
-            **Q: 為什麼查不到價格？**
-            > 可能是日期太近或航線無直飛。試試放寬日期範圍或換難度較低的航線。
-
-            **Q: 通知沒有收到？**
-            > 1. 確認 `.env` 中的 token/webhook 正確
-            > 2. 到「通知與系統設定」發送測試通知確認
-            > 3. 檢查通知冷卻時間（預設 6h 內不重複推播）
-
-            **Q: 過期監控會浪費 API 額度嗎？**
-            > 不會！系統會自動停用出發日已過的監控。
-
-            **Q: 可以同時監控多少條航線？**
-            > 每日查兩次時，一個監控約 60 次／月；250 次免費額度建議最多 4 個啟用監控。
-            """
-        )
-
-    with st.expander("使用注意事項"):
-        st.markdown(
-            """
-            - 平常排程每個監控只做一次主查詢，達標時才補查回程與開票平台
-            - SerpAPI 免費額度有限，建議固定每日 1～2 次，不要使用高頻間隔
-            - 價格僅供參考，下單前請至航空公司或 OTA 再確認
-            - 勿將 `.env` 上傳公開儲存庫
-            - 介面採一致的淺色主題，確保長時間閱讀清楚舒適
-            - 資料庫定期清理可在「通知與系統設定」執行
-            """
-        )
+        st.divider()
+        health = get_scheduler_health()
+        st.caption("排程器")
+        if health["healthy"]:
+            st.success("運作正常")
+        else:
+            st.warning("需要檢查")
+        st.caption(f"下次：{_format_datetime(health['next_run'])}")
+        usage = db.get_api_usage_summary("serpapi", SERPAPI_MONTHLY_LIMIT)
+        if usage["limit"]:
+            st.progress(min(1.0, float(usage["attempted"]) / float(usage["limit"])), text=f"額度 {usage['attempted']} / {usage['limit']}")
+        else:
+            st.caption(f"本月 API 嘗試 {usage['attempted']} 次")
+        st.caption("通知：" + "、".join(configured_channels()))
+        return page
 
 
-def main():
-
+def main() -> None:
     page = sidebar()
-    if page == "儀表板":
-        page_dashboard()
-    elif page == "搜尋航班":
-        page_search()
-    elif page == "價格歷史":
-        page_history()
-    elif page == "監控管理":
-        page_monitors()
-    elif page == "通知與系統設定":
-        page_settings()
-    else:
-        page_help()
+    pages = {
+        "營運總覽": page_dashboard,
+        "搜尋與比較": page_search,
+        "監控策略": page_monitors,
+        "價格情報": page_price_intelligence,
+        "執行與通知": page_runs_and_notifications,
+        "系統設定": page_settings,
+        "備份與復原": page_backup_restore,
+        "使用說明": page_help,
+    }
+    pages[page]()
 
 
 if __name__ == "__main__":
