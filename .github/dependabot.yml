@@ -4,7 +4,9 @@ updates:
     directory: "/"
     schedule:
       interval: monthly
-    open-pull-requests-limit: 5
+    # requirements*.lock are universal, hash-pinned uv outputs and must be
+    # regenerated atomically with their direct dependency ranges.
+    open-pull-requests-limit: 0
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

@@ -42,6 +42,29 @@ def _now() -> datetime:
     return datetime.now(TAIPEI_TZ)
 
 
+def _next_aligned_supervisor_tick(
+    now: Optional[datetime] = None,
+    tick_minutes: Optional[int] = None,
+) -> datetime:
+    """Return the next wall-clock boundary for the supervisor interval.
+
+    APScheduler intervals otherwise inherit the service start offset.  A
+    process started at 11:49:25 would consequently tick at 11:59:25 and
+    12:04:25, delaying a 12:00 monitor until the latter tick.  Anchoring the
+    interval to epoch-aligned minute boundaries keeps 5-minute supervision on
+    :00, :05, :10, ... regardless of restarts.
+    """
+
+    current = (now or _now()).astimezone(TAIPEI_TZ)
+    minutes = max(
+        1,
+        int(SCHEDULER_TICK_MINUTES if tick_minutes is None else tick_minutes),
+    )
+    interval_seconds = minutes * 60
+    next_epoch = ((int(current.timestamp()) // interval_seconds) + 1) * interval_seconds
+    return datetime.fromtimestamp(next_epoch, tz=TAIPEI_TZ)
+
+
 def _write_status(**updates) -> None:
     """Persist a machine-readable heartbeat without exposing secrets."""
     STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -891,17 +914,30 @@ def _run_owned_service(service_lock: ProcessLock) -> int:
             schedule=f"每 {minutes} 分鐘",
         )
 
+    # Capture the wall-clock boundary before startup recovery.  If recovery
+    # crosses that boundary, APScheduler treats it as a coalesced misfire and
+    # runs once immediately after start, so no exact slot is skipped.
+    first_aligned_tick = _next_aligned_supervisor_tick()
+    log_message("啟動排程補漏檢查…")
+    _supervisor_tick(
+        fallback_policy=fallback_policy,
+        owner_token=service_lock.owner.token,
+    )
+
     scheduler.add_job(
         _supervisor_tick,
         "interval",
         minutes=SCHEDULER_TICK_MINUTES,
         id="scheduler_supervisor",
         replace_existing=True,
-        next_run_time=_now() + timedelta(seconds=10),
+        next_run_time=first_aligned_tick,
         kwargs={
             "fallback_policy": fallback_policy,
             "owner_token": service_lock.owner.token,
         },
+    )
+    log_message(
+        f"排程監督器已對齊時鐘；下次巡檢 {first_aligned_tick.strftime('%H:%M:%S')}"
     )
 
     log_message("=" * 50)

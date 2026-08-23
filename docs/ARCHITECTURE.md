@@ -60,7 +60,11 @@ Failed channel deliveries release their payload claim so a later run can retry.
 ## Scheduler supervision and recovery
 
 1. One APScheduler interval tick is the only production dispatch owner for
-   global, fixed-time, daily, and interval monitor slots.
+   global, fixed-time, daily, and interval monitor slots. Its first run is
+   anchored to the next wall-clock grid boundary (`:00`, `:05`, ... by
+   default), independent of process start time. The service also performs one
+   synchronous recovery pass before APScheduler starts; a crossed boundary is
+   retained as a coalesced misfire, so startup cannot create a timing gap.
 2. A heartbeat is atomically replaced through a unique same-directory temporary
    file before slow work, between outbox/monitor batches, before a retry, and at
    completion. A process that loses lifetime/dispatch ownership never overwrites

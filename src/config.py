@@ -72,7 +72,7 @@ try:
 except ValueError:
     MESSAGE_DEDUPE_HOURS = 24.0
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.1.1"
 
 DB_PATH = BASE_DIR / "data" / "flights.db"
 DATA_DIR = BASE_DIR / "data"

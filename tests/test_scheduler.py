@@ -49,6 +49,20 @@ class SchedulerSafetyTests(unittest.TestCase):
         self.assertEqual(payload["last_result_count"], 1)
         self.assertIn("updated_at", payload)
 
+    def test_supervisor_tick_is_aligned_to_wall_clock(self):
+        timezone = ZoneInfo("Asia/Taipei")
+        before_noon = datetime(2026, 8, 23, 11, 59, 35, tzinfo=timezone)
+        exact_boundary = datetime(2026, 8, 23, 12, 0, 0, tzinfo=timezone)
+
+        self.assertEqual(
+            scheduler_service._next_aligned_supervisor_tick(before_noon, 5),
+            datetime(2026, 8, 23, 12, 0, 0, tzinfo=timezone),
+        )
+        self.assertEqual(
+            scheduler_service._next_aligned_supervisor_tick(exact_boundary, 5),
+            datetime(2026, 8, 23, 12, 5, 0, tzinfo=timezone),
+        )
+
     def test_status_writes_use_distinct_same_directory_temp_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             status_file = Path(temp_dir) / "scheduler_status.json"
@@ -649,11 +663,14 @@ class SchedulerSafetyTests(unittest.TestCase):
     def test_interval_mode_has_only_one_durable_dispatch_owner(self):
         fake_scheduler = MagicMock()
         fake_lock = self._fake_lock()
+        now = datetime(2026, 8, 23, 11, 59, 35, tzinfo=ZoneInfo("Asia/Taipei"))
         with (
             patch.object(scheduler_service, "BlockingScheduler", return_value=fake_scheduler),
             patch.object(scheduler_service, "ProcessLock", return_value=fake_lock),
             patch.object(scheduler_service, "maintenance_active", return_value=False),
             patch.object(scheduler_service.db, "init_db"),
+            patch.object(scheduler_service, "_now", return_value=now),
+            patch.object(scheduler_service, "_supervisor_tick") as startup_tick,
             patch.object(scheduler_service, "log_message"),
             patch.object(scheduler_service, "_write_status"),
             patch.dict(
@@ -667,6 +684,16 @@ class SchedulerSafetyTests(unittest.TestCase):
         job_ids = [call.kwargs.get("id") for call in fake_scheduler.add_job.call_args_list]
         self.assertNotIn("flight_check_interval", job_ids)
         self.assertIn("scheduler_supervisor", job_ids)
+        startup_tick.assert_called_once()
+        supervisor_job = next(
+            call
+            for call in fake_scheduler.add_job.call_args_list
+            if call.kwargs.get("id") == "scheduler_supervisor"
+        )
+        self.assertEqual(
+            supervisor_job.kwargs["next_run_time"],
+            datetime(2026, 8, 23, 12, 0, tzinfo=ZoneInfo("Asia/Taipei")),
+        )
 
     def test_fixed_mode_has_only_one_durable_dispatch_owner_after_sleep(self):
         fake_scheduler = MagicMock()
@@ -676,6 +703,7 @@ class SchedulerSafetyTests(unittest.TestCase):
             patch.object(scheduler_service, "ProcessLock", return_value=fake_lock),
             patch.object(scheduler_service, "maintenance_active", return_value=False),
             patch.object(scheduler_service.db, "init_db"),
+            patch.object(scheduler_service, "_supervisor_tick") as startup_tick,
             patch.object(scheduler_service, "log_message"),
             patch.object(scheduler_service, "_write_status"),
             patch.dict(
@@ -689,6 +717,7 @@ class SchedulerSafetyTests(unittest.TestCase):
         job_ids = [call.kwargs.get("id") for call in fake_scheduler.add_job.call_args_list]
         self.assertNotIn("flight_check_cron", job_ids)
         self.assertIn("scheduler_supervisor", job_ids)
+        startup_tick.assert_called_once()
 
 
 if __name__ == "__main__":
