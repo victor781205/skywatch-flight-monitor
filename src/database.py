@@ -6,14 +6,15 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from .config import DB_PATH
 
-
 _OUTBOX_TIMEZONE = ZoneInfo("Asia/Taipei")
+DATABASE_SCHEMA_VERSION = 8
+DEFAULT_RUN_LEASE_MINUTES = 30
+DEFAULT_QUOTA_RESERVATION_MINUTES = 10
 
 
 def _outbox_time(value: Optional[datetime] = None) -> datetime:
@@ -119,7 +120,20 @@ def init_db() -> None:
                 operation TEXT NOT NULL,
                 success INTEGER NOT NULL DEFAULT 1,
                 detail TEXT,
+                reservation_token TEXT,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS api_quota_reservations (
+                token TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                period TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'reserved',
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                reconciled_at TEXT,
+                detail TEXT
             );
 
             CREATE TABLE IF NOT EXISTS api_quota_warnings (
@@ -144,8 +158,20 @@ def init_db() -> None:
                 error_message TEXT,
                 backfill INTEGER NOT NULL DEFAULT 0,
                 result_json TEXT,
+                lease_token TEXT,
+                lease_expires_at TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(monitor_id) REFERENCES monitors(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS monitor_run_leases (
+                monitor_id INTEGER PRIMARY KEY,
+                run_id TEXT NOT NULL UNIQUE,
+                owner_token TEXT NOT NULL UNIQUE,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(monitor_id) REFERENCES monitors(id) ON DELETE CASCADE,
+                FOREIGN KEY(run_id) REFERENCES check_runs(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS notification_outbox (
@@ -160,6 +186,10 @@ def init_db() -> None:
                 next_attempt_at TEXT NOT NULL,
                 last_error TEXT,
                 dedupe_key TEXT NOT NULL UNIQUE,
+                lease_token TEXT,
+                lease_expires_at TEXT,
+                provider_message_id TEXT,
+                provider_receipt_json TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 sent_at TEXT,
@@ -222,13 +252,82 @@ def init_db() -> None:
         _ensure_column(conn, "monitors", "next_run_at", "TEXT")
         _ensure_column(conn, "monitors", "last_run_id", "TEXT")
         _ensure_column(conn, "monitors", "schedule_effective_at", "TEXT")
+        _ensure_column(conn, "api_usage", "reservation_token", "TEXT")
+        _ensure_column(conn, "check_runs", "lease_token", "TEXT")
+        _ensure_column(conn, "check_runs", "lease_expires_at", "TEXT")
+        _ensure_column(conn, "notification_outbox", "lease_token", "TEXT")
+        _ensure_column(conn, "notification_outbox", "lease_expires_at", "TEXT")
+        _ensure_column(conn, "notification_outbox", "provider_message_id", "TEXT")
+        _ensure_column(conn, "notification_outbox", "provider_receipt_json", "TEXT")
+        conn.executescript(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_api_usage_reservation
+                ON api_usage(reservation_token)
+                WHERE reservation_token IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_quota_reservations_period
+                ON api_quota_reservations(provider, period, status);
+            CREATE INDEX IF NOT EXISTS idx_monitor_run_leases_expiry
+                ON monitor_run_leases(expires_at);
+            """
+        )
         conn.execute(
             "UPDATE monitors SET schedule_effective_at=COALESCE(schedule_effective_at, created_at)"
         )
         conn.execute(
-            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '7') "
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            ,
+            (str(DATABASE_SCHEMA_VERSION),),
         )
+        _recover_stale_runtime_state(conn)
+
+
+def _recover_stale_runtime_state(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, int]:
+    """Close expired run owners during startup without touching live workers."""
+    current = _outbox_time(now)
+    stamp = current.isoformat(timespec="seconds")
+    stale_run_ids: List[str] = []
+    rows = conn.execute(
+        "SELECT id, started_at, lease_expires_at FROM check_runs WHERE status='running'"
+    ).fetchall()
+    for row in rows:
+        expires_at = row["lease_expires_at"]
+        if expires_at:
+            try:
+                expired = _outbox_time(datetime.fromisoformat(str(expires_at))) <= current
+            except (TypeError, ValueError):
+                expired = True
+        else:
+            expired = _check_run_lease_expired(row["started_at"], now=current)
+        if expired:
+            stale_run_ids.append(str(row["id"]))
+
+    for run_id in stale_run_ids:
+        conn.execute(
+            """
+            UPDATE check_runs
+            SET status='failed', completed_at=?, lease_expires_at=?,
+                error_stage='startup_recovery',
+                error_message='expired run lease recovered during startup'
+            WHERE id=? AND status='running'
+            """,
+            (stamp, stamp, run_id),
+        )
+    removed = conn.execute(
+        """
+        DELETE FROM monitor_run_leases
+        WHERE expires_at<=? OR NOT EXISTS (
+            SELECT 1 FROM check_runs cr
+            WHERE cr.id=monitor_run_leases.run_id AND cr.status='running'
+        )
+        """,
+        (stamp,),
+    )
+    return {"runs": len(stale_run_ids), "leases": int(removed.rowcount)}
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -273,8 +372,30 @@ def add_price_record(
     flight_number: str = "",
     raw_json: str = "",
     travel_class: int = 1,
+    monitor_id: Optional[int] = None,
+    run_id: Optional[str] = None,
+    lease_token: Optional[str] = None,
 ) -> int:
     with get_db() as conn:
+        if run_id is not None and monitor_id is not None:
+            conn.execute("BEGIN IMMEDIATE")
+            owned = conn.execute(
+                """
+                SELECT 1 FROM monitor_run_leases l
+                JOIN monitors m ON m.id=l.monitor_id
+                JOIN check_runs cr ON cr.id=l.run_id
+                WHERE l.monitor_id=? AND l.run_id=? AND l.owner_token=?
+                  AND m.active=1 AND cr.status='running' AND l.expires_at>?
+                """,
+                (
+                    int(monitor_id),
+                    str(run_id),
+                    str(lease_token or ""),
+                    _outbox_time().isoformat(timespec="seconds"),
+                ),
+            ).fetchone()
+            if not owned:
+                raise PermissionError("monitor run lease was revoked before history write")
         cur = conn.execute(
             """
             INSERT INTO price_history (
@@ -334,7 +455,6 @@ def get_price_history(
 
 
 def get_latest_price(route_id: int, outbound_date: str, return_date: Optional[str] = None) -> Optional[float]:
-    history = get_price_history(route_id, outbound_date, return_date, limit=1)
     # get_price_history orders ASC; for latest use DESC query
     with get_db() as conn:
         if return_date:
@@ -430,6 +550,7 @@ def add_monitor(
                 else existing.get("schedule_effective_at") or existing.get("created_at") or now_stamp
             )
             with get_db() as conn:
+                conn.execute("BEGIN IMMEDIATE")
                 conn.execute(
                     """
                     UPDATE monitors SET target_price=?, trip_type=?, quota_mode=?,
@@ -451,6 +572,16 @@ def add_monitor(
                         schedule_effective_at,
                         existing["id"],
                     ),
+                )
+                _cancel_monitor_outbox(
+                    conn,
+                    int(existing["id"]),
+                    reason="monitor updated from duplicate create",
+                )
+                _revoke_monitor_run(
+                    conn,
+                    int(existing["id"]),
+                    reason="monitor updated from duplicate create",
                 )
             return {
                 "id": int(existing["id"]),
@@ -510,25 +641,142 @@ def list_monitors(active_only: bool = False) -> List[Dict[str, Any]]:
         return [dict(r) for r in conn.execute(sql).fetchall()]
 
 
-def update_monitor_check(monitor_id: int, last_price: Optional[float]) -> None:
+def update_monitor_check(
+    monitor_id: int,
+    last_price: Optional[float],
+    *,
+    run_id: Optional[str] = None,
+    lease_token: Optional[str] = None,
+) -> None:
     with get_db() as conn:
-        conn.execute(
+        if run_id is None:
+            conn.execute(
+                """
+                UPDATE monitors SET last_checked=?, last_price=? WHERE id=?
+                """,
+                (datetime.now().isoformat(timespec="seconds"), last_price, monitor_id),
+            )
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
             """
-            UPDATE monitors
-            SET last_checked=?, last_price=?
-            WHERE id=?
+            UPDATE monitors SET last_checked=?, last_price=?
+            WHERE id=? AND active=1 AND EXISTS (
+                SELECT 1 FROM monitor_run_leases l
+                JOIN check_runs cr ON cr.id=l.run_id
+                WHERE l.monitor_id=monitors.id AND l.run_id=? AND l.owner_token=?
+                  AND cr.status='running' AND l.expires_at>?
+            )
             """,
-            (datetime.now().isoformat(timespec="seconds"), last_price, monitor_id),
+            (
+                datetime.now().isoformat(timespec="seconds"),
+                last_price,
+                int(monitor_id),
+                str(run_id),
+                str(lease_token or ""),
+                _outbox_time().isoformat(timespec="seconds"),
+            ),
         )
+        if cursor.rowcount != 1:
+            raise PermissionError("monitor run lease was revoked before update")
+
+
+def _cancel_monitor_outbox(
+    conn: sqlite3.Connection,
+    monitor_id: int,
+    *,
+    reason: str,
+    now: Optional[datetime] = None,
+) -> int:
+    stamp = _outbox_time(now).isoformat(timespec="seconds")
+    # A claimed request may already be in flight.  Its outcome is ambiguous,
+    # so never call it cancelled or retry it automatically.
+    sending = conn.execute(
+        """
+        UPDATE notification_outbox
+        SET status='delivery_unknown', last_error=?, updated_at=?,
+            lease_token=NULL, lease_expires_at=NULL
+        WHERE monitor_id=? AND status='sending'
+        """,
+        ((reason + "; delivery state unknown")[:500], stamp, int(monitor_id)),
+    )
+    pending = conn.execute(
+        """
+        UPDATE notification_outbox
+        SET status='cancelled', last_error=?, updated_at=?,
+            lease_token=NULL, lease_expires_at=NULL
+        WHERE monitor_id=? AND status IN ('pending', 'retry')
+        """,
+        (reason[:500], stamp, int(monitor_id)),
+    )
+    return int(sending.rowcount) + int(pending.rowcount)
+
+
+def _revoke_monitor_run(
+    conn: sqlite3.Connection,
+    monitor_id: int,
+    *,
+    reason: str,
+    now: Optional[datetime] = None,
+) -> int:
+    stamp = _outbox_time(now).isoformat(timespec="seconds")
+    cursor = conn.execute(
+        """
+        UPDATE check_runs
+        SET status='cancelled', completed_at=?, error_stage='monitor_state',
+            error_message=?, lease_expires_at=?
+        WHERE monitor_id=? AND status='running'
+        """,
+        (stamp, reason[:500], stamp, int(monitor_id)),
+    )
+    conn.execute("DELETE FROM monitor_run_leases WHERE monitor_id=?", (int(monitor_id),))
+    return int(cursor.rowcount)
 
 
 def set_monitor_active(monitor_id: int, active: bool) -> None:
+    stamp = datetime.now().isoformat(timespec="seconds")
     with get_db() as conn:
-        conn.execute("UPDATE monitors SET active=? WHERE id=?", (1 if active else 0, monitor_id))
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT active, schedule_effective_at FROM monitors WHERE id=?", (int(monitor_id),)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"monitor {monitor_id} not found")
+        was_active = bool(row["active"])
+        if active:
+            if was_active:
+                conn.execute("UPDATE monitors SET active=1 WHERE id=?", (int(monitor_id),))
+            else:
+                conn.execute(
+                    """
+                    UPDATE monitors
+                    SET active=1, schedule_effective_at=?, next_run_at=NULL
+                    WHERE id=?
+                    """,
+                    (stamp, int(monitor_id)),
+                )
+        else:
+            conn.execute(
+                "UPDATE monitors SET active=0, next_run_at=NULL WHERE id=?",
+                (int(monitor_id),),
+            )
+            _cancel_monitor_outbox(
+                conn, int(monitor_id), reason="monitor paused", now=datetime.now()
+            )
+            _revoke_monitor_run(
+                conn, int(monitor_id), reason="monitor paused", now=datetime.now()
+            )
 
 
 def delete_monitor(monitor_id: int) -> None:
     with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _cancel_monitor_outbox(
+            conn, int(monitor_id), reason="monitor deleted", now=datetime.now()
+        )
+        _revoke_monitor_run(
+            conn, int(monitor_id), reason="monitor deleted", now=datetime.now()
+        )
         conn.execute("DELETE FROM notification_claims WHERE monitor_id=?", (monitor_id,))
         conn.execute("DELETE FROM notifications WHERE monitor_id=?", (monitor_id,))
         conn.execute("DELETE FROM monitors WHERE id=?", (monitor_id,))
@@ -746,14 +994,24 @@ def expire_monitors() -> int:
     """將出發日已過的 active 監控自動設為 inactive。回傳受影響筆數。"""
     today = datetime.now().strftime("%Y-%m-%d")
     with get_db() as conn:
-        cur = conn.execute(
-            """
-            UPDATE monitors SET active=0
-            WHERE active=1 AND outbound_date < ?
-            """,
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT id FROM monitors WHERE active=1 AND outbound_date < ?",
             (today,),
-        )
-        return cur.rowcount
+        ).fetchall()
+        for row in rows:
+            monitor_id = int(row["id"])
+            conn.execute(
+                "UPDATE monitors SET active=0, next_run_at=NULL WHERE id=?",
+                (monitor_id,),
+            )
+            _cancel_monitor_outbox(
+                conn, monitor_id, reason="monitor travel date expired"
+            )
+            _revoke_monitor_run(
+                conn, monitor_id, reason="monitor travel date expired"
+            )
+        return len(rows)
 
 
 def cleanup_old_records(days: int = 90) -> int:
@@ -813,18 +1071,186 @@ def record_api_usage(
         )
 
 
-def get_api_usage_summary(
-    provider: str,
-    monthly_limit: int = 0,
-    now: Optional[datetime] = None,
-) -> Dict[str, Any]:
-    current = now or datetime.now()
+def _quota_period_bounds(current: datetime) -> tuple[str, datetime, datetime]:
     period = current.strftime("%Y-%m")
     start = current.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     if start.month == 12:
         end = start.replace(year=start.year + 1, month=1)
     else:
         end = start.replace(month=start.month + 1)
+    return period, start, end
+
+
+def reserve_api_quota_request(
+    provider: str,
+    operation: str,
+    monthly_limit: int,
+    *,
+    now: Optional[datetime] = None,
+    lease_minutes: int = DEFAULT_QUOTA_RESERVATION_MINUTES,
+) -> Dict[str, Any]:
+    """Atomically reserve one provider request before network I/O.
+
+    A crashed owner cannot silently return quota to the pool: expired
+    reservations are conservatively reconciled as attempted/unknown before a
+    new reservation is considered.  Any database failure propagates so callers
+    fail closed instead of issuing an unaccounted request.
+    """
+    current = _outbox_time(now)
+    period, start, end = _quota_period_bounds(current)
+    stamp = current.isoformat(timespec="seconds")
+    expires = (current + timedelta(minutes=max(1, int(lease_minutes)))).isoformat(
+        timespec="seconds"
+    )
+    provider_key = str(provider).strip().lower()
+    if not provider_key:
+        raise ValueError("provider is required")
+    operation_key = str(operation).strip()[:80]
+    if not operation_key:
+        raise ValueError("operation is required")
+    limit = max(0, int(monthly_limit))
+    token = uuid.uuid4().hex
+    with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        expired = conn.execute(
+            """
+            SELECT token, provider, operation FROM api_quota_reservations
+            WHERE status='reserved' AND expires_at<=?
+            """,
+            (stamp,),
+        ).fetchall()
+        for item in expired:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO api_usage (
+                    provider, operation, success, detail, reservation_token, created_at
+                ) VALUES (?, ?, 0, 'reservation_expired_unknown', ?, ?)
+                """,
+                (item["provider"], item["operation"], item["token"], stamp),
+            )
+            conn.execute(
+                """
+                UPDATE api_quota_reservations
+                SET status='consumed_unknown', reconciled_at=?,
+                    detail='reservation expired after possible request'
+                WHERE token=? AND status='reserved'
+                """,
+                (stamp, item["token"]),
+            )
+
+        used_row = conn.execute(
+            """
+            SELECT COUNT(*) AS total FROM api_usage
+            WHERE provider=? AND created_at>=? AND created_at<?
+            """,
+            (
+                provider_key,
+                start.isoformat(timespec="seconds"),
+                end.isoformat(timespec="seconds"),
+            ),
+        ).fetchone()
+        reserved_row = conn.execute(
+            """
+            SELECT COUNT(*) AS total FROM api_quota_reservations
+            WHERE provider=? AND period=? AND status='reserved'
+            """,
+            (provider_key, period),
+        ).fetchone()
+        used = int(used_row["total"] or 0)
+        reserved = int(reserved_row["total"] or 0)
+        if limit and used + reserved >= limit:
+            return {
+                "allowed": False,
+                "provider": provider_key,
+                "period": period,
+                "used": used,
+                "reserved": reserved,
+                "limit": limit,
+                "remaining": 0,
+                "reason": "monthly_quota_exhausted",
+            }
+        conn.execute(
+            """
+            INSERT INTO api_quota_reservations (
+                token, provider, period, operation, status,
+                created_at, expires_at
+            ) VALUES (?, ?, ?, ?, 'reserved', ?, ?)
+            """,
+            (token, provider_key, period, operation_key, stamp, expires),
+        )
+        return {
+            "allowed": True,
+            "token": token,
+            "provider": provider_key,
+            "period": period,
+            "used": used,
+            "reserved": reserved + 1,
+            "limit": limit,
+            "remaining": max(0, limit - used - reserved - 1) if limit else None,
+            "expires_at": expires,
+        }
+
+
+def reconcile_api_quota_request(
+    token: str,
+    *,
+    attempted: bool,
+    success: bool = False,
+    detail: str = "",
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Consume or release a reservation exactly once."""
+    current = _outbox_time(now)
+    stamp = current.isoformat(timespec="seconds")
+    with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM api_quota_reservations WHERE token=?", (str(token),)
+        ).fetchone()
+        if not row:
+            raise ValueError("quota reservation not found")
+        if str(row["status"]) != "reserved":
+            return dict(row)
+        status = "consumed" if attempted else "released"
+        if attempted:
+            conn.execute(
+                """
+                INSERT INTO api_usage (
+                    provider, operation, success, detail, reservation_token, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["provider"],
+                    row["operation"],
+                    1 if success else 0,
+                    str(detail)[:160],
+                    str(token),
+                    stamp,
+                ),
+            )
+        cur = conn.execute(
+            """
+            UPDATE api_quota_reservations
+            SET status=?, reconciled_at=?, detail=?
+            WHERE token=? AND status='reserved'
+            """,
+            (status, stamp, str(detail)[:500] or None, str(token)),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("quota reservation ownership was lost")
+        updated = conn.execute(
+            "SELECT * FROM api_quota_reservations WHERE token=?", (str(token),)
+        ).fetchone()
+        return dict(updated)
+
+
+def get_api_usage_summary(
+    provider: str,
+    monthly_limit: int = 0,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    current = now or datetime.now()
+    period, start, end = _quota_period_bounds(current)
     with get_db() as conn:
         row = conn.execute(
             """
@@ -836,22 +1262,33 @@ def get_api_usage_summary(
             """,
             (provider.lower(), start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")),
         ).fetchone()
+        reserved_row = conn.execute(
+            """
+            SELECT COUNT(*) AS total FROM api_quota_reservations
+            WHERE provider=? AND period=? AND status='reserved'
+            """,
+            (provider.lower(), period),
+        ).fetchone()
     attempted = int(row["total"] or 0)
     # A timeout or provider error is not proof that a request was free. Treat
     # every network attempt as quota consumption so the guard fails safe near
     # a free-tier limit. The successful/failed split remains diagnostic.
     used = attempted
+    reserved = int(reserved_row["total"] or 0)
+    effective_used = used + reserved
     limit = max(0, int(monthly_limit))
     return {
         "provider": provider.lower(),
         "period": period,
         "used": used,
+        "effective_used": effective_used,
         "attempted": attempted,
         "successful": int(row["successful"] or 0),
         "failed": int(row["failed"] or 0),
+        "reserved": reserved,
         "limit": limit,
-        "remaining": max(0, limit - used) if limit else None,
-        "percent": (used / limit * 100.0) if limit else None,
+        "remaining": max(0, limit - used - reserved) if limit else None,
+        "percent": (effective_used / limit * 100.0) if limit else None,
     }
 
 
@@ -952,6 +1389,7 @@ def update_monitor_policies(
     if not updates:
         return
     with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
             "SELECT schedule_type, schedule_value, schedule_effective_at, created_at "
             "FROM monitors WHERE id=?",
@@ -980,14 +1418,107 @@ def update_monitor_policies(
         cur = conn.execute(f"UPDATE monitors SET {', '.join(updates)} WHERE id=?", values)
         if cur.rowcount != 1:
             raise ValueError(f"monitor {monitor_id} not found")
-
-
-def set_monitor_next_run(monitor_id: int, next_run_at: Optional[str], run_id: Optional[str] = None) -> None:
-    with get_db() as conn:
-        conn.execute(
-            "UPDATE monitors SET next_run_at=?, last_run_id=COALESCE(?, last_run_id) WHERE id=?",
-            (next_run_at, run_id, int(monitor_id)),
+        _cancel_monitor_outbox(
+            conn,
+            int(monitor_id),
+            reason="monitor policy changed",
+            now=datetime.now(),
         )
+        _revoke_monitor_run(
+            conn,
+            int(monitor_id),
+            reason="monitor policy changed",
+            now=datetime.now(),
+        )
+
+
+def set_monitor_next_run(
+    monitor_id: int,
+    next_run_at: Optional[str],
+    run_id: Optional[str] = None,
+    *,
+    lease_token: Optional[str] = None,
+) -> None:
+    with get_db() as conn:
+        if run_id is None:
+            conn.execute(
+                "UPDATE monitors SET next_run_at=? WHERE id=?",
+                (next_run_at, int(monitor_id)),
+            )
+            return
+        cursor = conn.execute(
+            """
+            UPDATE monitors
+            SET next_run_at=?, last_run_id=?
+            WHERE id=? AND active=1 AND EXISTS (
+                SELECT 1 FROM monitor_run_leases l
+                WHERE l.monitor_id=monitors.id AND l.run_id=? AND l.owner_token=?
+            )
+            """,
+            (
+                next_run_at,
+                run_id,
+                int(monitor_id),
+                run_id,
+                str(lease_token or ""),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise PermissionError("monitor run lease is no longer active")
+
+
+def assert_monitor_run_lease(
+    monitor_id: int,
+    run_id: str,
+    lease_token: str,
+    *,
+    now: Optional[datetime] = None,
+    renew_minutes: int = DEFAULT_RUN_LEASE_MINUTES,
+) -> Dict[str, Any]:
+    """Validate active monitor ownership and renew its fenced lease."""
+    current = _outbox_time(now)
+    stamp = current.isoformat(timespec="seconds")
+    expires = (current + timedelta(minutes=max(5, int(renew_minutes)))).isoformat(
+        timespec="seconds"
+    )
+    with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT l.*, m.active, cr.status
+            FROM monitor_run_leases l
+            JOIN monitors m ON m.id=l.monitor_id
+            JOIN check_runs cr ON cr.id=l.run_id
+            WHERE l.monitor_id=? AND l.run_id=? AND l.owner_token=?
+            """,
+            (int(monitor_id), str(run_id), str(lease_token)),
+        ).fetchone()
+        if (
+            not row
+            or not bool(row["active"])
+            or str(row["status"]) != "running"
+            or str(row["expires_at"]) <= stamp
+        ):
+            raise PermissionError("monitor run lease is inactive or expired")
+        cursor = conn.execute(
+            """
+            UPDATE monitor_run_leases SET expires_at=?
+            WHERE monitor_id=? AND run_id=? AND owner_token=? AND expires_at>?
+            """,
+            (expires, int(monitor_id), str(run_id), str(lease_token), stamp),
+        )
+        if cursor.rowcount != 1:
+            raise PermissionError("monitor run lease was lost")
+        conn.execute(
+            """
+            UPDATE check_runs SET lease_expires_at=?
+            WHERE id=? AND status='running' AND lease_token=?
+            """,
+            (expires, str(run_id), str(lease_token)),
+        )
+        result = dict(row)
+        result["expires_at"] = expires
+        return result
 
 
 def _check_run_lease_expired(
@@ -1017,70 +1548,178 @@ def create_check_run(
     started_at: Optional[datetime] = None,
     lease_timeout_minutes: int = 30,
 ) -> Dict[str, Any]:
-    """Create or reclaim one idempotent scheduled run lease.
-
-    A process may die after inserting the ``running`` row.  Once that lease is
-    stale, the same row is atomically reclaimed so the unique scheduled-slot
-    constraint still prevents concurrent execution without suppressing the
-    slot forever.
-    """
-    current = started_at or datetime.now()
+    """Acquire a fenced per-monitor run and optional scheduled-slot lease."""
+    current = _outbox_time(started_at)
     stamp = current.isoformat(timespec="seconds")
+    lease_minutes = max(5, int(lease_timeout_minutes))
+    lease_expires = (current + timedelta(minutes=lease_minutes)).isoformat(
+        timespec="seconds"
+    )
     run_id = str(uuid.uuid4())
+    owner_token = uuid.uuid4().hex
     with get_db() as conn:
-        cur = conn.execute(
-            """
-            INSERT OR IGNORE INTO check_runs (
-                id, monitor_id, trigger, scheduled_slot, status, started_at,
-                api_calls, backfill, created_at
-            ) VALUES (?, ?, ?, ?, 'running', ?, 0, ?, ?)
-            """,
-            (run_id, monitor_id, trigger, scheduled_slot, stamp, 1 if backfill else 0, stamp),
-        )
-        if cur.rowcount == 1:
-            return {"id": run_id, "created": True, "status": "running"}
-        row = conn.execute(
-            "SELECT * FROM check_runs WHERE monitor_id=? AND scheduled_slot=?",
-            (monitor_id, scheduled_slot),
-        ).fetchone()
-        if not row:
-            raise RuntimeError("run ledger conflict without an existing row")
-        if str(row["status"]) == "running" and _check_run_lease_expired(
-            row["started_at"],
-            now=current,
-            lease_timeout_minutes=lease_timeout_minutes,
-        ):
+        conn.execute("BEGIN IMMEDIATE")
+        reclaim_row: Optional[sqlite3.Row] = None
+        if monitor_id is not None:
+            monitor = conn.execute(
+                "SELECT active FROM monitors WHERE id=?", (int(monitor_id),)
+            ).fetchone()
+            if not monitor:
+                raise ValueError(f"monitor {monitor_id} not found")
+            if not bool(monitor["active"]):
+                return {
+                    "id": "",
+                    "created": False,
+                    "status": "inactive",
+                    "reason": "monitor_inactive",
+                }
+
+            active_lease = conn.execute(
+                "SELECT * FROM monitor_run_leases WHERE monitor_id=?",
+                (int(monitor_id),),
+            ).fetchone()
+            if active_lease and str(active_lease["expires_at"]) > stamp:
+                existing = conn.execute(
+                    "SELECT * FROM check_runs WHERE id=?", (active_lease["run_id"],)
+                ).fetchone()
+                result = dict(existing) if existing else {
+                    "id": str(active_lease["run_id"]),
+                    "status": "running",
+                }
+                result.update({"created": False, "reason": "monitor_busy"})
+                return result
+            if active_lease:
+                old = conn.execute(
+                    "SELECT * FROM check_runs WHERE id=?", (active_lease["run_id"],)
+                ).fetchone()
+                conn.execute(
+                    "DELETE FROM monitor_run_leases WHERE monitor_id=? AND owner_token=?",
+                    (int(monitor_id), active_lease["owner_token"]),
+                )
+                if (
+                    old
+                    and str(old["status"]) == "running"
+                    and scheduled_slot is not None
+                    and str(old["scheduled_slot"] or "") == str(scheduled_slot)
+                ):
+                    reclaim_row = old
+                elif old and str(old["status"]) == "running":
+                    conn.execute(
+                        """
+                        UPDATE check_runs
+                        SET status='failed', completed_at=?, duration_ms=NULL,
+                            error_stage='run_lease', error_message='run lease expired',
+                            lease_expires_at=?
+                        WHERE id=? AND status='running' AND lease_token=?
+                        """,
+                        (stamp, stamp, old["id"], active_lease["owner_token"]),
+                    )
+
+            if reclaim_row is None and scheduled_slot is not None:
+                existing_slot = conn.execute(
+                    "SELECT * FROM check_runs WHERE monitor_id=? AND scheduled_slot=?",
+                    (int(monitor_id), scheduled_slot),
+                ).fetchone()
+                if existing_slot:
+                    if str(existing_slot["status"]) != "running":
+                        result = dict(existing_slot)
+                        result["created"] = False
+                        result["reason"] = "slot_already_processed"
+                        return result
+                    if not _check_run_lease_expired(
+                        existing_slot["started_at"],
+                        now=current,
+                        lease_timeout_minutes=lease_minutes,
+                    ):
+                        result = dict(existing_slot)
+                        result.update({"created": False, "reason": "monitor_busy"})
+                        return result
+                    reclaim_row = existing_slot
+
+            # Legacy slotless rows predate monitor_run_leases. Close them
+            # conservatively once their lease is stale so manual/TG execution
+            # can never overlap an abandoned owner forever.
+            cutoff = (current - timedelta(minutes=lease_minutes)).isoformat(
+                timespec="seconds"
+            )
+            conn.execute(
+                """
+                UPDATE check_runs
+                SET status='failed', completed_at=?, error_stage='run_lease',
+                    error_message='stale unowned run reclaimed', lease_expires_at=?
+                WHERE monitor_id=? AND status='running' AND started_at<=?
+                  AND id<>COALESCE(?, '')
+                """,
+                (
+                    stamp,
+                    stamp,
+                    int(monitor_id),
+                    cutoff,
+                    str(reclaim_row["id"]) if reclaim_row else None,
+                ),
+            )
+
+        if reclaim_row is not None:
             reclaimed = conn.execute(
                 """
                 UPDATE check_runs
                 SET trigger=?, status='running', started_at=?, completed_at=NULL,
                     duration_ms=NULL, api_calls=0, error_stage=NULL,
-                    error_message=NULL, backfill=?, result_json=NULL, created_at=?
+                    error_message=NULL, backfill=?, result_json=NULL,
+                    lease_token=?, lease_expires_at=?, created_at=?
                 WHERE id=? AND status='running' AND started_at=?
                 """,
                 (
                     trigger,
                     stamp,
                     1 if backfill else 0,
+                    owner_token,
+                    lease_expires,
                     stamp,
-                    row["id"],
-                    row["started_at"],
+                    reclaim_row["id"],
+                    reclaim_row["started_at"],
                 ),
             )
-            if reclaimed.rowcount == 1:
-                return {
-                    "id": str(row["id"]),
-                    "created": True,
-                    "status": "running",
-                    "reclaimed": True,
-                }
-            row = conn.execute(
-                "SELECT * FROM check_runs WHERE monitor_id=? AND scheduled_slot=?",
-                (monitor_id, scheduled_slot),
+            if reclaimed.rowcount != 1:
+                raise RuntimeError("run lease changed while reclaiming")
+            run_id = str(reclaim_row["id"])
+        else:
+            conn.execute(
+                """
+                INSERT INTO check_runs (
+                    id, monitor_id, trigger, scheduled_slot, status, started_at,
+                    api_calls, backfill, lease_token, lease_expires_at, created_at
+                ) VALUES (?, ?, ?, ?, 'running', ?, 0, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    monitor_id,
+                    trigger,
+                    scheduled_slot,
+                    stamp,
+                    1 if backfill else 0,
+                    owner_token,
+                    lease_expires,
+                    stamp,
+                ),
             ).fetchone()
-        result = dict(row)
-        result["created"] = False
-        return result
+        if monitor_id is not None:
+            conn.execute(
+                """
+                INSERT INTO monitor_run_leases (
+                    monitor_id, run_id, owner_token, expires_at, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (int(monitor_id), run_id, owner_token, lease_expires, stamp),
+            )
+        return {
+            "id": run_id,
+            "created": True,
+            "status": "running",
+            "lease_token": owner_token,
+            "lease_expires_at": lease_expires,
+            "reclaimed": reclaim_row is not None,
+        }
 
 
 def finish_check_run(
@@ -1092,25 +1731,44 @@ def finish_check_run(
     error_message: str = "",
     result: Optional[Dict[str, Any]] = None,
     completed_at: Optional[datetime] = None,
+    lease_token: Optional[str] = None,
 ) -> None:
-    if status not in {"succeeded", "partial", "failed", "skipped", "missed", "backfilled"}:
+    if status not in {
+        "succeeded", "partial", "failed", "skipped", "missed", "backfilled", "cancelled"
+    }:
         raise ValueError("unsupported run status")
-    completed = completed_at or datetime.now()
+    completed = _outbox_time(completed_at)
     with get_db() as conn:
-        row = conn.execute("SELECT started_at FROM check_runs WHERE id=?", (run_id,)).fetchone()
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT started_at, monitor_id, trigger, status, lease_token "
+            "FROM check_runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
         if not row:
             raise ValueError(f"run {run_id} not found")
+        if str(row["status"]) != "running":
+            raise RuntimeError("run is no longer owned by this worker")
+        expected_token = str(row["lease_token"] or "")
+        supplied_token = str(lease_token or "")
+        # The scheduler's immediate missed-slot marker predates fencing and is
+        # the sole compatibility path. All network-capable monitor runs must
+        # present the token returned by create_check_run.
+        if expected_token and not supplied_token and str(row["trigger"]) == "missed":
+            supplied_token = expected_token
+        if expected_token != supplied_token:
+            raise PermissionError("run lease token does not match")
         try:
-            started = datetime.fromisoformat(str(row["started_at"]))
+            started = _outbox_time(datetime.fromisoformat(str(row["started_at"])))
             duration_ms = max(0, int((completed - started).total_seconds() * 1000))
         except (TypeError, ValueError):
             duration_ms = None
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE check_runs
             SET status=?, completed_at=?, duration_ms=?, api_calls=?,
-                error_stage=?, error_message=?, result_json=?
-            WHERE id=?
+                error_stage=?, error_message=?, result_json=?, lease_expires_at=?
+            WHERE id=? AND status='running' AND COALESCE(lease_token, '')=?
             """,
             (
                 status,
@@ -1120,9 +1778,36 @@ def finish_check_run(
                 error_stage[:80] or None,
                 error_message[:500] or None,
                 json.dumps(result or {}, ensure_ascii=False, default=str, separators=(",", ":")),
+                completed.isoformat(timespec="seconds"),
                 run_id,
+                supplied_token,
             ),
         )
+        if cursor.rowcount != 1:
+            raise RuntimeError("run lease was lost before completion")
+        if row["monitor_id"] is not None:
+            conn.execute(
+                """
+                UPDATE monitors SET last_run_id=?
+                WHERE id=? AND active=1 AND EXISTS (
+                    SELECT 1 FROM monitor_run_leases l
+                    WHERE l.monitor_id=monitors.id AND l.run_id=? AND l.owner_token=?
+                )
+                """,
+                (
+                    run_id,
+                    int(row["monitor_id"]),
+                    run_id,
+                    supplied_token,
+                ),
+            )
+            conn.execute(
+                """
+                DELETE FROM monitor_run_leases
+                WHERE monitor_id=? AND run_id=? AND owner_token=?
+                """,
+                (int(row["monitor_id"]), run_id, supplied_token),
+            )
 
 
 def list_check_runs(limit: int = 100, monitor_id: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -1183,10 +1868,30 @@ def enqueue_notification(
     max_attempts: int = 4,
     next_attempt_at: Optional[datetime] = None,
     replace_pending: bool = False,
+    run_lease_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     now = _outbox_time()
     due = _outbox_time(next_attempt_at) if next_attempt_at is not None else now
     with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if run_id is not None and monitor_id is not None:
+            owned = conn.execute(
+                """
+                SELECT 1 FROM monitor_run_leases l
+                JOIN monitors m ON m.id=l.monitor_id
+                JOIN check_runs cr ON cr.id=l.run_id
+                WHERE l.monitor_id=? AND l.run_id=? AND l.owner_token=?
+                  AND m.active=1 AND cr.status='running' AND l.expires_at>?
+                """,
+                (
+                    int(monitor_id),
+                    str(run_id),
+                    str(run_lease_token or ""),
+                    now.isoformat(timespec="seconds"),
+                ),
+            ).fetchone()
+            if not owned:
+                raise PermissionError("cannot enqueue for an inactive run lease")
         cur = conn.execute(
             """
             INSERT OR IGNORE INTO notification_outbox (
@@ -1241,7 +1946,11 @@ def claim_due_notifications(
     *,
     lease_timeout_minutes: int = 10,
 ) -> List[Dict[str, Any]]:
-    """Atomically lease due rows and recover abandoned sending leases."""
+    """Atomically lease due rows with a fencing token.
+
+    An abandoned Telegram ``sending`` row is delivery-ambiguous and therefore
+    becomes ``delivery_unknown`` instead of being sent again automatically.
+    """
     current = _outbox_time(now)
     stamp = current.isoformat(timespec="seconds")
     stale_before = (
@@ -1253,9 +1962,21 @@ def claim_due_notifications(
         conn.execute(
             """
             UPDATE notification_outbox
+            SET status='delivery_unknown', updated_at=?, lease_expires_at=?,
+                last_error=COALESCE(last_error, 'delivery lease expired; Telegram receipt unknown'),
+                lease_token=NULL
+            WHERE status='sending' AND updated_at<=? AND channel='telegram'
+            """,
+            (stamp, stamp, stale_before),
+        )
+        conn.execute(
+            """
+            UPDATE notification_outbox
             SET status='retry', next_attempt_at=?, updated_at=?,
-                last_error=COALESCE(last_error, 'delivery lease expired')
+                last_error=COALESCE(last_error, 'delivery lease expired'),
+                lease_token=NULL, lease_expires_at=NULL
             WHERE status='sending' AND updated_at<=?
+              AND channel<>'telegram'
               AND attempt_count < max_attempts
             """,
             (stamp, stamp, stale_before),
@@ -1263,9 +1984,10 @@ def claim_due_notifications(
         conn.execute(
             """
             UPDATE notification_outbox
-            SET status='failed', updated_at=?,
+            SET status='failed', updated_at=?, lease_token=NULL, lease_expires_at=NULL,
                 last_error=COALESCE(last_error, 'delivery lease expired')
             WHERE status='sending' AND updated_at<=?
+              AND channel<>'telegram'
               AND attempt_count >= max_attempts
             """,
             (stamp, stale_before),
@@ -1280,13 +2002,18 @@ def claim_due_notifications(
             (stamp, max(1, min(int(limit), 100))),
         ).fetchall()
         for row in rows:
+            lease_token = uuid.uuid4().hex
+            lease_expires = (
+                current + timedelta(minutes=max(1, int(lease_timeout_minutes)))
+            ).isoformat(timespec="seconds")
             cur = conn.execute(
                 """
                 UPDATE notification_outbox
-                SET status='sending', attempt_count=attempt_count+1, updated_at=?
+                SET status='sending', attempt_count=attempt_count+1, updated_at=?,
+                    lease_token=?, lease_expires_at=?
                 WHERE id=? AND status IN ('pending', 'retry')
                 """,
-                (stamp, int(row["id"])),
+                (stamp, lease_token, lease_expires, int(row["id"])),
             )
             if cur.rowcount == 1:
                 current = conn.execute(
@@ -1296,27 +2023,73 @@ def claim_due_notifications(
     return claimed
 
 
+def outbox_delivery_is_owned(
+    outbox_id: int,
+    lease_token: str,
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Fence the final network-send boundary against pause/delete races."""
+    stamp = _outbox_time(now).isoformat(timespec="seconds")
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT o.monitor_id, o.status, o.lease_token, o.lease_expires_at,
+                   m.active AS monitor_active
+            FROM notification_outbox o
+            LEFT JOIN monitors m ON m.id=o.monitor_id
+            WHERE o.id=?
+            """,
+            (int(outbox_id),),
+        ).fetchone()
+        if not row:
+            return False
+        if str(row["status"]) != "sending":
+            return False
+        if str(row["lease_token"] or "") != str(lease_token or ""):
+            return False
+        if str(row["lease_expires_at"] or "") <= stamp:
+            return False
+        return row["monitor_id"] is None or bool(row["monitor_active"])
+
+
 def complete_outbox_delivery(
     outbox_id: int,
     *,
     success: bool,
     error: str = "",
     now: Optional[datetime] = None,
+    lease_token: Optional[str] = None,
+    delivery_unknown: bool = False,
+    retry_after_seconds: Optional[float] = None,
+    provider_message_id: Optional[str | int] = None,
+    provider_receipt: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     current = _outbox_time(now)
     with get_db() as conn:
         row = conn.execute(
-            "SELECT attempt_count, max_attempts FROM notification_outbox WHERE id=?",
+            "SELECT attempt_count, max_attempts, status, lease_token "
+            "FROM notification_outbox WHERE id=?",
             (int(outbox_id),),
         ).fetchone()
         if not row:
             raise ValueError(f"outbox item {outbox_id} not found")
+        if str(row["status"]) != "sending":
+            raise RuntimeError("outbox delivery is no longer leased")
+        expected_token = str(row["lease_token"] or "")
+        supplied_token = str(lease_token or "")
+        if expected_token != supplied_token:
+            raise PermissionError("outbox lease token does not match")
         attempts = int(row["attempt_count"])
         max_attempts = int(row["max_attempts"])
         if success:
             status = "sent"
             next_attempt = current
             sent_at = current.isoformat(timespec="seconds")
+        elif delivery_unknown:
+            status = "delivery_unknown"
+            next_attempt = current
+            sent_at = None
         elif attempts >= max_attempts:
             status = "failed"
             next_attempt = current
@@ -1324,13 +2097,19 @@ def complete_outbox_delivery(
         else:
             status = "retry"
             delay_minutes = min(60, 2 ** max(0, attempts - 1) * 5)
-            next_attempt = current + timedelta(minutes=delay_minutes)
+            provider_delay = max(0.0, float(retry_after_seconds or 0.0))
+            next_attempt = current + max(
+                timedelta(minutes=delay_minutes), timedelta(seconds=provider_delay)
+            )
             sent_at = None
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE notification_outbox
-            SET status=?, next_attempt_at=?, last_error=?, updated_at=?, sent_at=?
-            WHERE id=?
+            SET status=?, next_attempt_at=?, last_error=?, updated_at=?, sent_at=?,
+                lease_token=NULL, lease_expires_at=NULL,
+                provider_message_id=COALESCE(?, provider_message_id),
+                provider_receipt_json=COALESCE(?, provider_receipt_json)
+            WHERE id=? AND status='sending' AND COALESCE(lease_token, '')=?
             """,
             (
                 status,
@@ -1338,9 +2117,19 @@ def complete_outbox_delivery(
                 error[:500] or None,
                 current.isoformat(timespec="seconds"),
                 sent_at,
+                str(provider_message_id) if provider_message_id is not None else None,
+                json.dumps(
+                    provider_receipt,
+                    ensure_ascii=False,
+                    default=str,
+                    separators=(",", ":"),
+                ) if provider_receipt is not None else None,
                 int(outbox_id),
+                supplied_token,
             ),
         )
+        if cursor.rowcount != 1:
+            raise RuntimeError("outbox lease was lost before completion")
         updated = conn.execute("SELECT * FROM notification_outbox WHERE id=?", (int(outbox_id),)).fetchone()
         return dict(updated)
 
@@ -1353,7 +2142,7 @@ def retry_outbox_delivery(outbox_id: int) -> None:
             UPDATE notification_outbox
             SET status='retry', attempt_count=0, next_attempt_at=?,
                 last_error=NULL, updated_at=?, sent_at=NULL
-            WHERE id=? AND status IN ('failed', 'retry')
+            WHERE id=? AND status IN ('failed', 'retry', 'delivery_unknown')
             """,
             (now, now, int(outbox_id)),
         )
@@ -1379,11 +2168,31 @@ def save_carrier_quotes(
     quotes: List[Dict[str, Any]],
     monitor_id: Optional[int] = None,
     run_id: Optional[str] = None,
+    run_lease_token: Optional[str] = None,
     recorded_at: Optional[datetime] = None,
 ) -> int:
     stamp = (recorded_at or datetime.now()).isoformat(timespec="seconds")
     inserted = 0
     with get_db() as conn:
+        if run_id is not None and monitor_id is not None:
+            conn.execute("BEGIN IMMEDIATE")
+            owned = conn.execute(
+                """
+                SELECT 1 FROM monitor_run_leases l
+                JOIN monitors m ON m.id=l.monitor_id
+                JOIN check_runs cr ON cr.id=l.run_id
+                WHERE l.monitor_id=? AND l.run_id=? AND l.owner_token=?
+                  AND m.active=1 AND cr.status='running' AND l.expires_at>?
+                """,
+                (
+                    int(monitor_id),
+                    str(run_id),
+                    str(run_lease_token or ""),
+                    _outbox_time().isoformat(timespec="seconds"),
+                ),
+            ).fetchone()
+            if not owned:
+                raise PermissionError("monitor run lease was revoked before quote write")
         for quote in quotes:
             price = quote.get("total_price", quote.get("price"))
             if price is None:

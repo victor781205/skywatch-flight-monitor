@@ -6,3 +6,4 @@ if exist ".venv\Scripts\python.exe" (
 ) else (
   python scheduler.py
 )
+exit /b %ERRORLEVEL%

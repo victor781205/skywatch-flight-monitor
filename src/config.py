@@ -1,6 +1,7 @@
 """應用程式設定"""
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -71,7 +72,7 @@ try:
 except ValueError:
     MESSAGE_DEDUPE_HOURS = 24.0
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 
 DB_PATH = BASE_DIR / "data" / "flights.db"
 DATA_DIR = BASE_DIR / "data"

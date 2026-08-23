@@ -28,6 +28,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertIn("travel_class", price_columns)
         self.assertIn("travel_class", monitor_columns)
         self.assertIn("schedule_effective_at", monitor_columns)
+        self.assertEqual(db.DATABASE_SCHEMA_VERSION, 8)
 
     def test_monitor_and_price_support_selected_class(self):
         route_id = db.upsert_route("TPE", "KIX")
@@ -91,7 +92,13 @@ class DatabaseTests(unittest.TestCase):
         self.assertTrue(first["created"])
         self.assertFalse(second["created"])
         self.assertEqual(first["id"], second["id"])
-        db.finish_check_run(first["id"], status="succeeded", api_calls=2, result={"price": 9000})
+        db.finish_check_run(
+            first["id"],
+            status="succeeded",
+            api_calls=2,
+            result={"price": 9000},
+            lease_token=first["lease_token"],
+        )
         saved = db.get_check_run(first["id"])
         self.assertEqual(saved["status"], "succeeded")
         self.assertEqual(saved["api_calls"], 2)
@@ -141,7 +148,11 @@ class DatabaseTests(unittest.TestCase):
         claimed = db.claim_due_notifications(now=now)
         self.assertEqual([item["id"] for item in claimed], [queued["id"]])
         failed = db.complete_outbox_delivery(
-            queued["id"], success=False, error="timeout", now=now
+            queued["id"],
+            success=False,
+            error="timeout",
+            now=now,
+            lease_token=claimed[0]["lease_token"],
         )
         self.assertEqual(failed["status"], "retry")
         claimed_again = db.claim_due_notifications(now=now + timedelta(minutes=6))
@@ -151,6 +162,7 @@ class DatabaseTests(unittest.TestCase):
             success=False,
             error="timeout",
             now=now + timedelta(minutes=6),
+            lease_token=claimed_again[0]["lease_token"],
         )
         self.assertEqual(final["status"], "failed")
         db.retry_outbox_delivery(queued["id"])
@@ -159,9 +171,9 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(reset["status"], "retry")
         self.assertEqual(len(db.claim_due_notifications()), 1)
 
-    def test_outbox_recovers_an_abandoned_sending_lease(self):
+    def test_telegram_outbox_does_not_retry_abandoned_ambiguous_send(self):
         now = datetime.now().replace(microsecond=0)
-        queued = db.enqueue_notification(
+        db.enqueue_notification(
             channel="telegram",
             message="recover me",
             dedupe_key="outbox-abandoned",
@@ -174,8 +186,149 @@ class DatabaseTests(unittest.TestCase):
         recovered = db.claim_due_notifications(
             now=now + timedelta(minutes=11), lease_timeout_minutes=10
         )
-        self.assertEqual([item["id"] for item in recovered], [queued["id"]])
-        self.assertEqual(recovered[0]["attempt_count"], 2)
+        self.assertEqual(recovered, [])
+        saved = db.list_notification_outbox()[0]
+        self.assertEqual(saved["status"], "delivery_unknown")
+        self.assertEqual(saved["attempt_count"], 1)
+
+    def test_per_monitor_lease_blocks_slotless_overlap_and_fences_old_owner(self):
+        route_id = db.upsert_route("TPE", "KIX")
+        monitor_id = db.add_monitor(route_id, "2026-09-01", 10000)["id"]
+        first = db.create_check_run(monitor_id, trigger="manual")
+        blocked = db.create_check_run(monitor_id, trigger="telegram")
+        self.assertTrue(first["created"])
+        self.assertFalse(blocked["created"])
+        self.assertEqual(blocked["reason"], "monitor_busy")
+        with self.assertRaises(PermissionError):
+            db.finish_check_run(
+                first["id"], status="succeeded", lease_token="wrong-owner"
+            )
+        db.finish_check_run(
+            first["id"], status="succeeded", lease_token=first["lease_token"]
+        )
+        following = db.create_check_run(monitor_id, trigger="telegram")
+        self.assertTrue(following["created"])
+
+    def test_stale_slotless_run_is_closed_before_replacement(self):
+        route_id = db.upsert_route("TPE", "NRT")
+        monitor_id = db.add_monitor(route_id, "2026-09-01", 10000)["id"]
+        stale_at = datetime.now().replace(microsecond=0) - timedelta(minutes=31)
+        stale = db.create_check_run(monitor_id, trigger="manual", started_at=stale_at)
+        replacement = db.create_check_run(
+            monitor_id, trigger="telegram", started_at=stale_at + timedelta(minutes=31)
+        )
+        self.assertTrue(replacement["created"])
+        self.assertNotEqual(replacement["id"], stale["id"])
+        self.assertEqual(db.get_check_run(stale["id"])["status"], "failed")
+
+    def test_startup_recovers_only_expired_runtime_leases(self):
+        route_id = db.upsert_route("TPE", "NRT")
+        monitor_id = db.add_monitor(route_id, "2026-09-01", 10000)["id"]
+        stale_at = datetime.now().replace(microsecond=0) - timedelta(minutes=31)
+        stale = db.create_check_run(monitor_id, trigger="manual", started_at=stale_at)
+
+        db.init_db()
+
+        recovered = db.get_check_run(stale["id"])
+        self.assertEqual(recovered["status"], "failed")
+        self.assertEqual(recovered["error_stage"], "startup_recovery")
+        fresh = db.create_check_run(monitor_id, trigger="manual")
+        self.assertTrue(fresh["created"])
+
+    def test_outbox_final_send_guard_observes_monitor_pause(self):
+        route_id = db.upsert_route("TPE", "HND")
+        monitor_id = db.add_monitor(route_id, "2026-10-01", 9000)["id"]
+        queued = db.enqueue_notification(
+            channel="telegram",
+            message="claimed fare",
+            dedupe_key="final-send-fence",
+            monitor_id=monitor_id,
+        )
+        claimed = db.claim_due_notifications()[0]
+        self.assertTrue(
+            db.outbox_delivery_is_owned(queued["id"], claimed["lease_token"])
+        )
+
+        db.set_monitor_active(monitor_id, False)
+
+        self.assertFalse(
+            db.outbox_delivery_is_owned(queued["id"], claimed["lease_token"])
+        )
+
+    def test_quota_reservation_is_atomic_and_reconciles_failed_attempt(self):
+        now = datetime(2026, 8, 23, 10, 0)
+        first = db.reserve_api_quota_request(
+            "serpapi", "flight_search", 1, now=now
+        )
+        blocked = db.reserve_api_quota_request(
+            "serpapi", "flight_search", 1, now=now
+        )
+        self.assertTrue(first["allowed"])
+        self.assertFalse(blocked["allowed"])
+        db.reconcile_api_quota_request(
+            first["token"], attempted=True, success=False, detail="timeout", now=now
+        )
+        summary = db.get_api_usage_summary("serpapi", 1, now=now)
+        self.assertEqual(summary["attempted"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["reserved"], 0)
+
+    def test_pause_and_policy_change_cancel_pending_outbox(self):
+        route_id = db.upsert_route("TPE", "BKK")
+        monitor_id = db.add_monitor(route_id, "2026-10-01", 9000)["id"]
+        policy_run = db.create_check_run(monitor_id, trigger="manual")
+        db.enqueue_notification(
+            channel="telegram", message="old", dedupe_key="old-policy", monitor_id=monitor_id
+        )
+        db.update_monitor_policies(monitor_id, quota_mode="lean")
+        self.assertEqual(db.list_notification_outbox()[0]["status"], "cancelled")
+        self.assertEqual(db.get_check_run(policy_run["id"])["status"], "cancelled")
+        with self.assertRaises(PermissionError):
+            db.assert_monitor_run_lease(
+                monitor_id, policy_run["id"], policy_run["lease_token"]
+            )
+        with self.assertRaises(PermissionError):
+            db.add_price_record(
+                route_id,
+                "2026-10-01",
+                8800,
+                monitor_id=monitor_id,
+                run_id=policy_run["id"],
+                lease_token=policy_run["lease_token"],
+            )
+        with self.assertRaises(PermissionError):
+            db.enqueue_notification(
+                channel="telegram",
+                message="stale result",
+                dedupe_key="stale-policy-result",
+                monitor_id=monitor_id,
+                run_id=policy_run["id"],
+                run_lease_token=policy_run["lease_token"],
+            )
+        previous_effective = db.get_monitor(monitor_id)["schedule_effective_at"]
+        db.set_monitor_active(monitor_id, False)
+        db.set_monitor_active(monitor_id, True)
+        self.assertGreaterEqual(
+            db.get_monitor(monitor_id)["schedule_effective_at"], previous_effective
+        )
+
+    def test_pause_marks_claimed_delivery_unknown_instead_of_retryable(self):
+        route_id = db.upsert_route("TPE", "HND")
+        monitor_id = db.add_monitor(route_id, "2026-10-01", 9000)["id"]
+        queued = db.enqueue_notification(
+            channel="telegram",
+            message="possibly in flight",
+            dedupe_key="pause-in-flight",
+            monitor_id=monitor_id,
+        )
+        claimed = db.claim_due_notifications()
+        self.assertEqual(claimed[0]["id"], queued["id"])
+
+        db.set_monitor_active(monitor_id, False)
+
+        saved = db.list_notification_outbox()[0]
+        self.assertEqual(saved["status"], "delivery_unknown")
+        self.assertIsNone(saved["lease_token"])
 
     def test_deferred_outbox_replaces_pending_digest_without_duplication(self):
         first_due = datetime.now().replace(microsecond=0) + timedelta(hours=1)

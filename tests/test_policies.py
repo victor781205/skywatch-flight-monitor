@@ -12,12 +12,10 @@ from src.policies import (
     PriceBasis,
     QuotaMode,
     QuotaPolicy,
-    ScheduleMode,
     SchedulePolicy,
     TimeWindow,
     normalize_airline,
 )
-
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 

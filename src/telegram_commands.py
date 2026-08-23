@@ -16,7 +16,6 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Optional
 
-
 ChatId = str | int
 
 
@@ -29,6 +28,7 @@ class TelegramCommandContext:
     username: Optional[str]
     raw_text: str
     command: str
+    chat_type: str = "private"
 
 
 @dataclass(frozen=True)
@@ -119,6 +119,7 @@ class TelegramCommandRouter:
         self,
         *,
         allowed_chat_ids: Iterable[ChatId] | ChatId,
+        allowed_user_ids: Iterable[ChatId] | ChatId = (),
         status_callback: Callable[[TelegramCommandContext], Any],
         quota_callback: Callable[[TelegramCommandContext], Any],
         check_estimate_callback: Callable[[TelegramCommandContext], Any],
@@ -127,6 +128,8 @@ class TelegramCommandRouter:
         confirmation_ttl_seconds: float = 120,
         clock: Callable[[], float] = time.monotonic,
         token_factory: Optional[Callable[[], str]] = None,
+        rate_limit_commands: int = 12,
+        rate_limit_window_seconds: float = 60.0,
     ) -> None:
         if confirmation_ttl_seconds <= 0:
             raise ValueError("confirmation_ttl_seconds 必須大於 0")
@@ -147,6 +150,14 @@ class TelegramCommandRouter:
         self._allowed_chat_ids = {
             self._normalise_id(chat_id) for chat_id in allowed_values
         }
+        if isinstance(allowed_user_ids, (str, int)):
+            allowed_users: Iterable[ChatId] = (allowed_user_ids,)
+        else:
+            allowed_users = allowed_user_ids
+        self._allowed_user_ids = {
+            self._normalise_id(user_id) for user_id in allowed_users
+            if self._normalise_id(user_id)
+        }
         self._status_callback = status_callback
         self._quota_callback = quota_callback
         self._check_estimate_callback = check_estimate_callback
@@ -159,6 +170,9 @@ class TelegramCommandRouter:
         )
         self._pending: dict[str, _PendingCheck] = {}
         self._consumed: dict[str, _ConsumedToken] = {}
+        self._rate_limit_commands = max(1, int(rate_limit_commands))
+        self._rate_limit_window = max(1.0, float(rate_limit_window_seconds))
+        self._rate_windows: dict[tuple[str, str], tuple[float, int]] = {}
         self._lock = threading.RLock()
 
     @staticmethod
@@ -172,6 +186,7 @@ class TelegramCommandRouter:
         *,
         user_id: Optional[ChatId] = None,
         username: Optional[str] = None,
+        chat_type: str = "private",
     ) -> TelegramCommandResult:
         """處理一則 Telegram 文字訊息，不執行任何網路傳送。"""
 
@@ -179,8 +194,13 @@ class TelegramCommandRouter:
         if parsed is None:
             if isinstance(text, str) and text.strip().startswith("/"):
                 normalised_chat_id = self._normalise_id(chat_id)
-                if normalised_chat_id not in self._allowed_chat_ids:
+                normalised_user_id = None if user_id is None else self._normalise_id(user_id)
+                if not self._is_authorised(
+                    normalised_chat_id, normalised_user_id, chat_type
+                ):
                     return self._unauthorised_result()
+                if not self._within_rate_limit(normalised_chat_id, normalised_user_id):
+                    return TelegramCommandResult(handled=False)
                 return TelegramCommandResult(
                     handled=True,
                     text="⚠️ 指令格式不正確。可用指令：/status、/quota、/check。",
@@ -197,15 +217,19 @@ class TelegramCommandRouter:
             return TelegramCommandResult(handled=False)
 
         normalised_chat_id = self._normalise_id(chat_id)
-        if normalised_chat_id not in self._allowed_chat_ids:
+        normalised_user_id = None if user_id is None else self._normalise_id(user_id)
+        if not self._is_authorised(normalised_chat_id, normalised_user_id, chat_type):
             return self._unauthorised_result(parsed.name)
+        if not self._within_rate_limit(normalised_chat_id, normalised_user_id):
+            return TelegramCommandResult(handled=False)
 
         context = TelegramCommandContext(
             chat_id=normalised_chat_id,
-            user_id=None if user_id is None else self._normalise_id(user_id),
+            user_id=normalised_user_id,
             username=username,
             raw_text=text.strip(),
             command=parsed.name,
+            chat_type=str(chat_type or "private").lower(),
         )
 
         if parsed.name == "status":
@@ -266,16 +290,43 @@ class TelegramCommandRouter:
             chat["id"],
             user_id=sender.get("id"),
             username=sender.get("username"),
+            chat_type=str(chat.get("type") or "private"),
         )
+
+    def _is_authorised(
+        self,
+        chat_id: str,
+        user_id: Optional[str],
+        chat_type: str,
+    ) -> bool:
+        if chat_id not in self._allowed_chat_ids:
+            return False
+        if str(chat_type or "private").lower() in {"group", "supergroup"}:
+            return bool(user_id and user_id in self._allowed_user_ids)
+        return True
+
+    def _within_rate_limit(self, chat_id: str, user_id: Optional[str]) -> bool:
+        now = self._clock()
+        key = (chat_id, user_id or "-")
+        with self._lock:
+            started, count = self._rate_windows.get(key, (now, 0))
+            if now - started >= self._rate_limit_window:
+                started, count = now, 0
+            if count >= self._rate_limit_commands:
+                self._rate_windows[key] = (started, count)
+                return False
+            self._rate_windows[key] = (started, count + 1)
+            stale_before = now - self._rate_limit_window * 2
+            for identity, (window_started, _) in list(self._rate_windows.items()):
+                if window_started < stale_before:
+                    del self._rate_windows[identity]
+            return True
 
     @staticmethod
     def _unauthorised_result(command: Optional[str] = None) -> TelegramCommandResult:
-        return TelegramCommandResult(
-            handled=True,
-            text="⛔ 此聊天室未獲授權。",
-            command=command,
-            ok=False,
-        )
+        # Stay silent to avoid confirming bot existence or access policy to an
+        # untrusted sender.
+        return TelegramCommandResult(handled=False, command=command, ok=False)
 
     @staticmethod
     def _usage_error(command: str, usage: str) -> TelegramCommandResult:

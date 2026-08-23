@@ -8,12 +8,10 @@ across process restarts.
 
 from __future__ import annotations
 
-import ctypes
 import json
 import os
 import threading
 import time
-import uuid
 from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -26,15 +24,22 @@ import requests
 
 from src import database as db
 from src.config import (
-    SERPAPI_MONTHLY_LIMIT,
+    DATA_DIR,
     SCHEDULER_HEARTBEAT_STALE_MINUTES,
+    SERPAPI_MONTHLY_LIMIT,
     TELEGRAM_ALLOWED_CHAT_IDS,
     TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
     TELEGRAM_COMMANDS_ENABLED,
 )
 from src.monitor import check_all_monitors
+from src.runtime_lock import (
+    ProcessLock,
+    lock_owner_alive,
+    maintenance_active,
+    wait_until_maintenance_complete,
+)
 from src.telegram_commands import CheckEstimate, TelegramCommandRouter
-
 
 ROOT = Path(__file__).resolve().parent
 STATUS_FILE = ROOT / "data" / "scheduler_status.json"
@@ -90,9 +95,15 @@ def scheduler_heartbeat_health(
 class TelegramAPIError(RuntimeError):
     """A deliberately sanitised Telegram/network failure."""
 
-    def __init__(self, *, retry_after: Optional[float] = None) -> None:
+    def __init__(
+        self,
+        *,
+        retry_after: Optional[float] = None,
+        delivery_unknown: bool = False,
+    ) -> None:
         super().__init__("Telegram API request failed")
         self.retry_after = retry_after
+        self.delivery_unknown = bool(delivery_unknown)
 
 
 class TelegramAPI:
@@ -119,19 +130,31 @@ class TelegramAPI:
                 json=dict(payload),
                 timeout=(self._connect_timeout, max(1.0, float(read_timeout))),
             )
-            response.raise_for_status()
-            document = response.json()
-        except (requests.RequestException, ValueError, TypeError):
+        except requests.Timeout:
+            raise TelegramAPIError(delivery_unknown=method == "sendMessage") from None
+        except requests.RequestException:
             # Never propagate a requests exception: its URL contains the token.
             raise TelegramAPIError() from None
 
-        if not isinstance(document, Mapping) or document.get("ok") is not True:
+        try:
+            document = response.json()
+        except (ValueError, TypeError):
+            document = {}
+
+        status_value = getattr(response, "status_code", 200)
+        status = status_value if isinstance(status_value, int) else 200
+        if status >= 400 or not isinstance(document, Mapping) or document.get("ok") is not True:
             retry_after = None
             parameters = document.get("parameters") if isinstance(document, Mapping) else None
             if isinstance(parameters, Mapping):
                 try:
                     retry_after = max(0.0, float(parameters.get("retry_after")))
                 except (TypeError, ValueError):
+                    retry_after = None
+            if retry_after is None:
+                try:
+                    retry_after = max(0.0, float(response.headers.get("Retry-After")))
+                except (AttributeError, TypeError, ValueError):
                     retry_after = None
             raise TelegramAPIError(retry_after=retry_after)
         return document.get("result")
@@ -150,10 +173,10 @@ class TelegramAPI:
             raise TelegramAPIError()
         return [dict(item) for item in result if isinstance(item, Mapping)]
 
-    def send_message(self, chat_id: str | int, text: str) -> None:
+    def send_message(self, chat_id: str | int, text: str) -> Any:
         # sendMessage is deliberately attempted once.  Retrying after an
         # ambiguous network timeout can create a duplicate Telegram message.
-        self._post(
+        return self._post(
             "sendMessage",
             {
                 "chat_id": str(chat_id),
@@ -240,6 +263,7 @@ class SchedulerHeartbeatWatchdog:
             "health": "unknown",
             "recipients": [],
             "delivered": [],
+            "delivery_unknown": [],
         }
 
     def _read_state(self) -> dict[str, Any]:
@@ -259,6 +283,13 @@ class SchedulerHeartbeatWatchdog:
                 "delivered": sorted(
                     {str(item) for item in document.get("delivered") or [] if str(item)}
                 ),
+                "delivery_unknown": sorted(
+                    {
+                        str(item)
+                        for item in document.get("delivery_unknown") or []
+                        if str(item)
+                    }
+                ),
             }
         except (FileNotFoundError, OSError, TypeError, ValueError):
             return self._empty_state()
@@ -273,6 +304,9 @@ class SchedulerHeartbeatWatchdog:
             "health": str(state.get("health") or "unknown"),
             "recipients": sorted({str(item) for item in state.get("recipients") or []}),
             "delivered": sorted({str(item) for item in state.get("delivered") or []}),
+            "delivery_unknown": sorted(
+                {str(item) for item in state.get("delivery_unknown") or []}
+            ),
             "updated_at": self.now_func().isoformat(timespec="seconds"),
         }
         temporary.write_text(
@@ -309,6 +343,7 @@ class SchedulerHeartbeatWatchdog:
                         "health": health,
                         "recipients": recipients,
                         "delivered": [],
+                        "delivery_unknown": [],
                     }
                 )
             else:
@@ -327,6 +362,7 @@ class SchedulerHeartbeatWatchdog:
                 item
                 for item in self._state["recipients"]
                 if item not in set(self._state.get("delivered") or [])
+                and item not in set(self._state.get("delivery_unknown") or [])
             )
             return WatchdogEvent(
                 phase="incident",
@@ -345,6 +381,7 @@ class SchedulerHeartbeatWatchdog:
                     "health": health,
                     "recipients": recipients,
                     "delivered": [],
+                    "delivery_unknown": [],
                 }
             )
             phase = "recovery"
@@ -359,6 +396,7 @@ class SchedulerHeartbeatWatchdog:
             item
             for item in self._state["recipients"]
             if item not in set(self._state.get("delivered") or [])
+            and item not in set(self._state.get("delivery_unknown") or [])
         )
         return WatchdogEvent(
             phase="recovery",
@@ -380,100 +418,33 @@ class SchedulerHeartbeatWatchdog:
         )
         if (
             event.phase == "recovery"
-            and set(updated["delivered"]) >= set(updated.get("recipients") or [])
+            and (
+                set(updated["delivered"])
+                | set(updated.get("delivery_unknown") or [])
+            ) >= set(updated.get("recipients") or [])
         ):
             updated = self._empty_state()
         self._persist(updated)
 
+    def mark_delivery_unknown(self, event: WatchdogEvent, chat_id: str | int) -> None:
+        """Fence an ambiguous send so the watchdog never auto-retries it."""
+        if str(self._state.get("phase")) != event.phase:
+            return
+        recipient = str(chat_id).strip()
+        if recipient not in set(self._state.get("recipients") or []):
+            return
+        updated = dict(self._state)
+        updated["delivery_unknown"] = sorted(
+            set(self._state.get("delivery_unknown") or []) | {recipient}
+        )
+        self._persist(updated)
 
-class SingleInstanceLock:
-    """A PID-owned filesystem lock with safe stale-process recovery."""
+
+class SingleInstanceLock(ProcessLock):
+    """Compatibility name for the shared PID/start-fingerprint process lock."""
 
     def __init__(self, path: Path = LOCK_FILE) -> None:
-        self.path = Path(path)
-        self.owner = f"{os.getpid()}:{uuid.uuid4().hex}"
-        self._held = False
-
-    @staticmethod
-    def _pid_alive(pid: int) -> bool:
-        if pid <= 0:
-            return False
-        if pid == os.getpid():
-            return True
-        if os.name == "nt":
-            # ``os.kill(pid, 0)`` is not a reliable existence probe on every
-            # supported Windows/Python combination.  Query-only OpenProcess
-            # never terminates or mutates the target process.
-            process_query_limited_information = 0x1000
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-            kernel32.OpenProcess.restype = ctypes.c_void_p
-            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-            handle = kernel32.OpenProcess(process_query_limited_information, 0, pid)
-            if handle:
-                kernel32.CloseHandle(handle)
-                return True
-            # Access denied still proves that a process owns the PID.
-            return ctypes.get_last_error() == 5
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-        return True
-
-    def _existing_owner_alive(self) -> bool:
-        try:
-            raw = self.path.read_text(encoding="utf-8").strip()
-            pid = int(raw.split(":", 1)[0])
-        except (FileNotFoundError, OSError, TypeError, ValueError):
-            return False
-        return self._pid_alive(pid)
-
-    def acquire(self) -> bool:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        for attempt in range(2):
-            try:
-                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                try:
-                    os.write(fd, self.owner.encode("ascii"))
-                finally:
-                    os.close(fd)
-                self._held = True
-                return True
-            except FileExistsError:
-                if attempt == 0 and not self._existing_owner_alive():
-                    try:
-                        self.path.unlink()
-                    except FileNotFoundError:
-                        pass
-                    except OSError:
-                        return False
-                    continue
-                return False
-        return False
-
-    def release(self) -> None:
-        if not self._held:
-            return
-        try:
-            if self.path.read_text(encoding="utf-8").strip() == self.owner:
-                self.path.unlink()
-        except (FileNotFoundError, OSError):
-            pass
-        finally:
-            self._held = False
-
-    def __enter__(self) -> "SingleInstanceLock":
-        if not self.acquire():
-            raise RuntimeError("Telegram command service is already running")
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.release()
+        super().__init__(Path(path), "telegram_commands")
 
 
 class CommandCallbacks:
@@ -619,12 +590,20 @@ class CommandCallbacks:
 def build_router(
     *,
     allowed_chat_ids: set[str] | list[str] | tuple[str, ...] = tuple(TELEGRAM_ALLOWED_CHAT_IDS),
+    allowed_user_ids: Optional[set[str] | list[str] | tuple[str, ...]] = None,
     bot_username: Optional[str] = None,
     callbacks: Optional[CommandCallbacks] = None,
 ) -> TelegramCommandRouter:
     handlers = callbacks or CommandCallbacks()
+    if allowed_user_ids is None:
+        allowed_user_ids = tuple(
+            value.strip()
+            for value in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").split(",")
+            if value.strip()
+        )
     return TelegramCommandRouter(
         allowed_chat_ids=allowed_chat_ids,
+        allowed_user_ids=allowed_user_ids,
         status_callback=handlers.status,
         quota_callback=handlers.quota,
         check_estimate_callback=handlers.estimate_check,
@@ -632,6 +611,51 @@ def build_router(
         bot_username=bot_username or os.getenv("TELEGRAM_BOT_USERNAME", ""),
         confirmation_ttl_seconds=120,
     )
+
+
+def telegram_readiness(
+    *,
+    lock_path: Path = LOCK_FILE,
+    status_path: Path = STATUS_FILE,
+    now: Optional[datetime] = None,
+) -> dict[str, dict[str, Any]]:
+    """Expose independent report, command, and watchdog readiness for the UI."""
+    report_configured = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+    commands_configured = bool(
+        TELEGRAM_COMMANDS_ENABLED and TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS
+    )
+    commands_running = commands_configured and lock_owner_alive(Path(lock_path))
+    scheduler_health, age = scheduler_heartbeat_health(
+        _read_scheduler_status(Path(status_path)), now=now
+    )
+    return {
+        "report": {
+            "ready": report_configured,
+            "configured": report_configured,
+            "reason": "ready" if report_configured else "missing_bot_token_or_report_chat",
+        },
+        "commands": {
+            "ready": commands_running,
+            "configured": commands_configured,
+            "running": commands_running,
+            "reason": (
+                "ready"
+                if commands_running
+                else "service_not_running"
+                if commands_configured
+                else "commands_not_configured"
+            ),
+        },
+        "watchdog": {
+            "ready": commands_running,
+            "configured": commands_configured,
+            "scheduler_health": scheduler_health,
+            "heartbeat_age_seconds": (
+                max(0, int(age.total_seconds())) if age is not None else None
+            ),
+            "reason": "ready" if commands_running else "command_service_not_running",
+        },
+    }
 
 
 class TelegramBotRunner:
@@ -687,6 +711,10 @@ class TelegramBotRunner:
         return chat.get("id") if isinstance(chat, Mapping) else None
 
     def poll_once(self) -> int:
+        if maintenance_active(DATA_DIR):
+            # Leave updates unacknowledged until restore/maintenance completes;
+            # no command callback or watchdog write may race a database swap.
+            return 0
         updates = self.api.get_updates(
             self.offset_store.next_offset,
             timeout=self.poll_timeout,
@@ -703,7 +731,9 @@ class TelegramBotRunner:
                         # remaining recipients.  Successful recipients are
                         # acknowledged now; failed ones remain pending and the
                         # runner applies its normal bounded retry backoff.
-                        if first_error is None:
+                        if exc.delivery_unknown:
+                            self.heartbeat_watchdog.mark_delivery_unknown(event, chat_id)
+                        elif first_error is None:
                             first_error = exc
                     else:
                         self.heartbeat_watchdog.mark_delivered(event, chat_id)
@@ -762,6 +792,14 @@ class TelegramBotRunner:
 
 
 def main() -> int:
+    if not wait_until_maintenance_complete(DATA_DIR, timeout_seconds=30):
+        print("Telegram 指令服務未啟動：系統仍在維護或復原。")
+        return 3
+    try:
+        db.init_db()
+    except Exception:
+        print("Telegram 指令服務未啟動：資料庫初始化失敗。")
+        return 3
     if not TELEGRAM_COMMANDS_ENABLED:
         print("Telegram 指令服務已由 TELEGRAM_COMMANDS_ENABLED 關閉。")
         return 0

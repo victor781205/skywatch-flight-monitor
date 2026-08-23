@@ -27,6 +27,7 @@ class TelegramCommandTests(unittest.TestCase):
         self.tokens = iter(("TOKEN01", "TOKEN02", "TOKEN03", "TOKEN04"))
         self.router = TelegramCommandRouter(
             allowed_chat_ids={123, "-456"},
+            allowed_user_ids={9},
             status_callback=self.status,
             quota_callback=self.quota,
             check_estimate_callback=self.estimate,
@@ -66,10 +67,41 @@ class TelegramCommandTests(unittest.TestCase):
     def test_unauthorised_chat_is_rejected_without_callback(self):
         result = self.router.handle("/status", 999)
 
-        self.assertTrue(result.handled)
+        self.assertFalse(result.handled)
         self.assertFalse(result.ok)
-        self.assertIn("未獲授權", result.text)
+        self.assertEqual(result.text, "")
         self.status.assert_not_called()
+
+    def test_group_requires_both_chat_and_sender_allowlists(self):
+        allowed = self.router.handle(
+            "/status", -456, user_id=9, chat_type="supergroup"
+        )
+        denied_sender = self.router.handle(
+            "/status", -456, user_id=10, chat_type="supergroup"
+        )
+        denied_chat = self.router.handle(
+            "/status", -999, user_id=9, chat_type="group"
+        )
+        self.assertTrue(allowed.handled)
+        self.assertFalse(denied_sender.handled)
+        self.assertFalse(denied_chat.handled)
+
+    def test_basic_rate_limit_silently_drops_excess_commands(self):
+        router = TelegramCommandRouter(
+            allowed_chat_ids={123},
+            status_callback=self.status,
+            quota_callback=self.quota,
+            check_estimate_callback=self.estimate,
+            check_callback=self.check,
+            clock=self.clock,
+            rate_limit_commands=2,
+            rate_limit_window_seconds=30,
+        )
+        self.assertTrue(router.handle("/status", 123, user_id=9).handled)
+        self.assertTrue(router.handle("/status", 123, user_id=9).handled)
+        self.assertFalse(router.handle("/status", 123, user_id=9).handled)
+        self.clock.value += 31
+        self.assertTrue(router.handle("/status", 123, user_id=9).handled)
 
     def test_string_allowlist_is_one_chat_id_not_character_ids(self):
         router = TelegramCommandRouter(
@@ -179,7 +211,7 @@ class TelegramCommandTests(unittest.TestCase):
                 "update_id": 1,
                 "message": {
                     "text": "/status",
-                    "chat": {"id": 123},
+                    "chat": {"id": 123, "type": "private"},
                     "from": {"id": 9, "username": "victor"},
                 },
             }

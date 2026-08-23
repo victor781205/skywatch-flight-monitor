@@ -22,6 +22,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 from .config import DB_PATH
 from .policies import AirlineRuleSet, NotificationPolicy, SchedulePolicy
+from .runtime_lock import ProcessLock, lock_owner_alive
 
 PathLike = Union[str, os.PathLike[str]]
 
@@ -609,6 +610,7 @@ def create_full_backup(destination: PathLike, db_path: PathLike = DB_PATH) -> Di
         monitor_hash = _sha256_bytes(monitor_bytes)
         manifest = {
             "schema_version": ARCHIVE_SCHEMA_VERSION,
+            "database_schema_version": monitors["preview"].get("database_schema_version"),
             "kind": ARCHIVE_KIND,
             "created_at": _utc_now(),
             "files": {"database": "database.sqlite", "monitors": "monitors.json"},
@@ -781,6 +783,131 @@ def _replace_from_file(source: Path, destination: Path) -> None:
         raise
 
 
+def _read_database_schema_version(database: Path) -> Optional[str]:
+    try:
+        with closing(sqlite3.connect(str(database), timeout=30.0)) as conn:
+            return _database_schema_version(conn)
+    except sqlite3.Error as exc:
+        raise BackupValidationError(f"Unable to read database schema version: {exc}") from exc
+
+
+def _database_schema_signature(database: Path) -> Dict[str, Tuple[str, ...]]:
+    """Describe application tables exactly enough to reject partial migrations."""
+
+    try:
+        with closing(sqlite3.connect(str(database), timeout=30.0)) as conn:
+            tables = [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                )
+            ]
+            return {
+                table: tuple(
+                    str(row[1])
+                    for row in conn.execute(
+                        f'PRAGMA table_info("{table.replace(chr(34), chr(34) * 2)}")'
+                    )
+                )
+                for table in tables
+            }
+    except sqlite3.Error as exc:
+        raise BackupValidationError(f"Unable to inspect database schema: {exc}") from exc
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    escaped = table.replace('"', '""')
+    return {str(row[1]) for row in conn.execute(f'PRAGMA table_info("{escaped}")')}
+
+
+def _quarantine_restored_work(database: Path) -> None:
+    """Prevent historical work from being delivered after a point-in-time restore."""
+
+    timestamp = _utc_now()
+    try:
+        with closing(sqlite3.connect(str(database), timeout=30.0)) as conn:
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            conn.execute("BEGIN IMMEDIATE")
+
+            if "check_runs" in tables:
+                columns = _table_columns(conn, "check_runs")
+                assignments = ["status='failed'"]
+                values: list[Any] = []
+                if "completed_at" in columns:
+                    assignments.append("completed_at=?")
+                    values.append(timestamp)
+                if "error_stage" in columns:
+                    assignments.append("error_stage='restore'")
+                if "error_message" in columns:
+                    assignments.append("error_message='Cancelled by database restore'")
+                if "lease_token" in columns:
+                    assignments.append("lease_token=NULL")
+                if "lease_expires_at" in columns:
+                    assignments.append("lease_expires_at=NULL")
+                conn.execute(
+                    f"UPDATE check_runs SET {', '.join(assignments)} WHERE status='running'",
+                    values,
+                )
+
+            if "notification_outbox" in tables:
+                columns = _table_columns(conn, "notification_outbox")
+                assignments = ["status='cancelled'"]
+                values = []
+                if "updated_at" in columns:
+                    assignments.append("updated_at=?")
+                    values.append(timestamp)
+                if "last_error" in columns:
+                    assignments.append("last_error='Cancelled by database restore'")
+                if "lease_token" in columns:
+                    assignments.append("lease_token=NULL")
+                if "lease_expires_at" in columns:
+                    assignments.append("lease_expires_at=NULL")
+                conn.execute(
+                    f"UPDATE notification_outbox SET {', '.join(assignments)} "
+                    "WHERE status IN ('pending', 'retry', 'sending')",
+                    values,
+                )
+
+            if "monitor_run_leases" in tables:
+                conn.execute("DELETE FROM monitor_run_leases")
+
+            if "api_quota_reservations" in tables:
+                columns = _table_columns(conn, "api_quota_reservations")
+                assignments = ["status='released'"]
+                values = []
+                if "reconciled_at" in columns:
+                    assignments.append("reconciled_at=?")
+                    values.append(timestamp)
+                if "detail" in columns:
+                    assignments.append("detail='Released by database restore'")
+                conn.execute(
+                    f"UPDATE api_quota_reservations SET {', '.join(assignments)} "
+                    "WHERE status='reserved'",
+                    values,
+                )
+
+            if "monitors" in tables:
+                columns = _table_columns(conn, "monitors")
+                assignments = []
+                values = []
+                if "next_run_at" in columns:
+                    assignments.append("next_run_at=NULL")
+                if "schedule_effective_at" in columns:
+                    assignments.append("schedule_effective_at=?")
+                    values.append(timestamp)
+                if assignments:
+                    conn.execute(f"UPDATE monitors SET {', '.join(assignments)}", values)
+            conn.commit()
+    except sqlite3.Error as exc:
+        raise BackupRestoreError(f"Unable to quarantine restored work: {exc}") from exc
+
+
 def restore_full_backup(
     source: PathLike,
     db_path: PathLike = DB_PATH,
@@ -833,19 +960,58 @@ def restore_full_backup(
         candidate.unlink(missing_ok=True)
         raise BackupValidationError(f"Unable to prepare backup restore: {exc}") from exc
 
-    restore_point = snapshot_database(
-        database, _restore_point_path(database, restore_dir, "full-restore")
-    )
+    candidate_schema = _read_database_schema_version(candidate)
+    if candidate_schema is None:
+        candidate.unlink(missing_ok=True)
+        raise BackupValidationError("Backup database schema version is missing")
+    declared_schema = manifest.get("database_schema_version")
+    if declared_schema is None:
+        declared_schema = (manifest.get("preview") or {}).get("database_schema_version")
+    if declared_schema is not None and str(declared_schema) != candidate_schema:
+        candidate.unlink(missing_ok=True)
+        raise BackupValidationError("Backup database schema version does not match its manifest")
+
+    maintenance_lock = ProcessLock(database.parent / "maintenance.lock", "backup_restore")
+    if not maintenance_lock.acquire():
+        candidate.unlink(missing_ok=True)
+        raise BackupRestoreError("Another maintenance or restore operation is already active")
+
+    restore_point: Optional[Path] = None
     replaced = False
     try:
+        active_workers = [
+            name
+            for name in ("scheduler.lock", "telegram_bot.lock")
+            if lock_owner_alive(database.parent / name)
+        ]
+        if active_workers:
+            raise BackupRestoreError(
+                "Stop active workers before restore: " + ", ".join(active_workers)
+            )
+
+        live_schema = _read_database_schema_version(database)
+        if live_schema is None or live_schema != candidate_schema:
+            raise BackupValidationError(
+                f"Database schema mismatch: live={live_schema!r}, backup={candidate_schema!r}"
+            )
+        if _database_schema_signature(database) != _database_schema_signature(candidate):
+            raise BackupValidationError(
+                "Database schema mismatch: backup tables or columns differ from the live schema"
+            )
+
+        restore_point = snapshot_database(
+            database, _restore_point_path(database, restore_dir, "full-restore")
+        )
         os.replace(candidate, database)
         replaced = True
         _remove_sqlite_sidecars(database)
         _validate_sqlite(database)
-    except (BackupError, OSError) as exc:
+        _quarantine_restored_work(database)
+        _validate_sqlite(database)
+    except (BackupError, OSError, sqlite3.Error) as exc:
         candidate.unlink(missing_ok=True)
         rollback_error: Optional[Exception] = None
-        if replaced:
+        if replaced and restore_point is not None:
             try:
                 _replace_from_file(restore_point, database)
                 _remove_sqlite_sidecars(database)
@@ -856,6 +1022,10 @@ def restore_full_backup(
         if rollback_error is not None:
             detail += f"; automatic rollback also failed: {rollback_error}"
         raise BackupRestoreError(detail) from exc
+    finally:
+        candidate.unlink(missing_ok=True)
+        maintenance_lock.release()
+    assert restore_point is not None
     return {
         "path": database,
         "source": archive_path,

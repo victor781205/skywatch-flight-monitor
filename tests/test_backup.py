@@ -9,6 +9,7 @@ from unittest import mock
 
 from src import backup
 from src import database as db
+from src.runtime_lock import ProcessLock
 
 
 class BackupTests(unittest.TestCase):
@@ -127,6 +128,12 @@ class BackupTests(unittest.TestCase):
         inspected = backup.inspect_backup(archive_path)
         self.assertEqual(inspected["preview"]["monitor_count"], 1)
         self.assertEqual(report["preview"]["route_count"], 1)
+        with zipfile.ZipFile(archive_path) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+        self.assertEqual(
+            str(manifest["database_schema_version"]),
+            str(db.DATABASE_SCHEMA_VERSION),
+        )
 
     def test_archive_path_traversal_is_rejected(self):
         valid = self.root / "valid.zip"
@@ -190,6 +197,79 @@ class BackupTests(unittest.TestCase):
 
         self.assertTrue(failed_live_validation)
         self.assertEqual(self._target_price(), 33333)
+
+    def test_restore_rejects_active_worker_without_changing_database(self):
+        archive_path = self.root / "before-change.zip"
+        backup.create_full_backup(archive_path, self.database)
+        self._set_target_price(44444)
+        worker = ProcessLock(self.database.parent / "scheduler.lock", "scheduler")
+        self.assertTrue(worker.acquire())
+        try:
+            with self.assertRaisesRegex(backup.BackupRestoreError, "Stop active workers"):
+                backup.restore_full_backup(archive_path, self.database)
+        finally:
+            worker.release()
+        self.assertEqual(self._target_price(), 44444)
+        self.assertFalse((self.database.parent / "maintenance.lock").exists())
+
+    def test_restore_rejects_database_schema_mismatch(self):
+        archive_path = self.root / "before-change.zip"
+        backup.create_full_backup(archive_path, self.database)
+        with closing(sqlite3.connect(self.database)) as conn:
+            conn.execute(
+                "UPDATE schema_meta SET value='999' WHERE key='schema_version'"
+            )
+            conn.commit()
+        with self.assertRaisesRegex(backup.BackupRestoreError, "schema mismatch"):
+            backup.restore_full_backup(archive_path, self.database)
+
+    def test_restore_quarantines_historical_work_and_resets_schedule(self):
+        with closing(sqlite3.connect(self.database)) as conn:
+            conn.execute(
+                "UPDATE monitors SET next_run_at='2026-10-01T00:00:00Z' WHERE id=?",
+                (self.monitor_id,),
+            )
+            conn.execute(
+                """
+                INSERT INTO check_runs
+                    (id, monitor_id, trigger, status, started_at, created_at)
+                VALUES ('old-run', ?, 'scheduled', 'running', '2026-01-01T00:00:00Z',
+                        '2026-01-01T00:00:00Z')
+                """,
+                (self.monitor_id,),
+            )
+            conn.execute(
+                """
+                INSERT INTO notification_outbox
+                    (run_id, monitor_id, channel, message, status, next_attempt_at,
+                     dedupe_key, created_at, updated_at)
+                VALUES ('old-run', ?, 'telegram', 'old quote', 'pending',
+                        '2026-01-01T00:00:00Z', 'old-message',
+                        '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+                """,
+                (self.monitor_id,),
+            )
+            conn.commit()
+        archive_path = self.root / "historical.zip"
+        backup.create_full_backup(archive_path, self.database)
+
+        backup.restore_full_backup(archive_path, self.database)
+
+        with closing(sqlite3.connect(self.database)) as conn:
+            run_status = conn.execute(
+                "SELECT status, error_stage FROM check_runs WHERE id='old-run'"
+            ).fetchone()
+            message_status = conn.execute(
+                "SELECT status FROM notification_outbox WHERE dedupe_key='old-message'"
+            ).fetchone()[0]
+            next_run, effective_at = conn.execute(
+                "SELECT next_run_at, schedule_effective_at FROM monitors WHERE id=?",
+                (self.monitor_id,),
+            ).fetchone()
+        self.assertEqual(run_status, ("failed", "restore"))
+        self.assertEqual(message_status, "cancelled")
+        self.assertIsNone(next_run)
+        self.assertTrue(effective_at)
 
     def test_bad_conflict_policy_is_rejected_before_snapshot(self):
         exported = self.root / "monitors.json"

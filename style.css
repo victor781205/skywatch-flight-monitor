@@ -720,11 +720,44 @@ button[data-testid="stBaseButton-headerNoPadding"] {
 .ui-monitor-card__dates { margin-top: 5px; color: var(--muted-strong); font: 11px/1.4 var(--font-mono); font-variant-numeric: tabular-nums; }
 .ui-monitor-card__conditions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
 .ui-monitor-card__condition { padding: 3px 7px; color: var(--muted-strong); background: var(--surface-subtle); border: 1px solid var(--border); border-radius: 999px; font-size: 10px; }
-.ui-monitor-card__prices { display: grid; grid-template-columns: repeat(2, auto); align-items: center; gap: 22px; }
-.ui-monitor-card__prices > div { display: grid; gap: 3px; }
-.ui-monitor-card__prices span { color: var(--muted); font-size: 10px; }
-.ui-monitor-card__prices strong { color: var(--fg); font: 730 16px/1.25 var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.ui-monitor-card__prices .ui-monitor-card__gap { color: var(--monitor-color); font-size: 9px; font-weight: 700; }
+.ui-monitor-card__prices {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, auto));
+    align-items: start;
+    gap: 24px;
+}
+.ui-monitor-card__prices > div {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
+    min-width: 96px;
+}
+.ui-monitor-card__prices span {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.4;
+    margin: 0;
+}
+.ui-monitor-card__prices strong {
+    color: var(--fg);
+    font: 760 17px/1.25 var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    margin: 0;
+}
+.ui-monitor-card__prices .ui-monitor-card__gap {
+    color: var(--monitor-color);
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1.3;
+    margin-top: 2px;
+}
+.ui-monitor-card__prices .ui-monitor-card__gap--placeholder {
+    visibility: hidden;
+    user-select: none;
+}
 
 /* Complete paired round-trip result: outbound | inbound | total. */
 .ui-flight-pair {
@@ -1057,7 +1090,10 @@ pre code { padding: 0; background: transparent; border: 0; }
         height: auto !important;
         max-height: 216px !important;
         bottom: auto !important;
-        overflow: hidden !important;
+        /* Unlike `hidden`, `clip` cannot be programmatically scrolled when a
+           later navigation item receives focus. Keep the sheet fixed and let
+           only the radiogroup own horizontal scrolling. */
+        overflow: clip !important;
         background: rgba(255, 255, 255, .98) !important;
         border-right: 0 !important;
         border-bottom: 1px solid var(--border) !important;
@@ -1068,8 +1104,23 @@ pre code { padding: 0; background: transparent; border: 0; }
         width: 100vw !important;
         height: auto !important;
         max-height: 216px !important;
-        overflow: hidden !important;
+        overflow: clip !important;
         padding: 10px 12px 12px !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
+        width: 100% !important;
+        min-width: 0 !important;
+        max-width: 100% !important;
+        padding-bottom: 0 !important;
+        overflow: clip !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] > div,
+    section[data-testid="stSidebar"] [data-testid="stVerticalBlock"],
+    section[data-testid="stSidebar"] [data-testid="stElementContainer"]:has([data-testid="stRadio"]) {
+        width: 100% !important;
+        min-width: 0 !important;
+        max-width: 100% !important;
+        overflow-x: clip !important;
     }
     section[data-testid="stSidebar"] [data-testid="stSidebarHeader"] {
         min-height: 44px !important;
@@ -1087,9 +1138,17 @@ pre code { padding: 0; background: transparent; border: 0; }
     section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
         display: none !important;
     }
+    section[data-testid="stSidebar"] [data-testid="stRadio"] {
+        width: 100% !important;
+        min-width: 0 !important;
+        overflow: hidden !important;
+    }
     section[data-testid="stSidebar"] [data-testid="stRadio"] div[role="radiogroup"] {
         display: flex !important;
         flex-direction: row !important;
+        flex-wrap: nowrap !important;
+        width: 100% !important;
+        min-width: 0 !important;
         gap: 6px !important;
         max-height: 54px !important;
         overflow-x: auto !important;
@@ -1109,6 +1168,7 @@ pre code { padding: 0; background: transparent; border: 0; }
     section[data-testid="stSidebar"] [data-testid="stRadio"] label {
         min-height: 42px !important;
         padding: 8px 11px !important;
+        white-space: nowrap !important;
     }
     section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] > [data-testid="stElementContainer"]:has([data-testid="stRadio"]) ~ [data-testid="stElementContainer"] {
         display: none !important;

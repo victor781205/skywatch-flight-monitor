@@ -1,5 +1,6 @@
-# Secrets
-.env
+# Secrets (track the documented template only)
+.env*
+!.env.example
 
 # Python
 __pycache__/
@@ -8,6 +9,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
 
 # Runtime data
 data/*.db
@@ -20,12 +24,25 @@ data/backups/
 data/*.log
 data/*.log.*
 data/*.lock
+data/maintenance.lock
 data/scheduler_status.json
 data/telegram_offset.json
 data/telegram_watchdog.json
+data/telegram_bot_status.json
 data/airports_iata.csv
 data/airports_iata.json
 legacy/
+
+# Database and user-created backup/export artifacts, regardless of location
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+skywatch-full-*.zip
+skywatch-monitors-*.json
+backups/
+exports/
 
 # Local design and submission working files
 skywatch-operations.html

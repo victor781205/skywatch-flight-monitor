@@ -17,6 +17,8 @@ flowchart LR
   N --> TG[Telegram]
   N --> DC[Discord]
   S --> H[Scheduler heartbeat JSON]
+  S --> B[Daily credential-free backup]
+  B --> BD[(data/backups)]
   H --> W[Telegram bot watchdog]
   W --> TG
   H --> UI
@@ -26,8 +28,9 @@ flowchart LR
 
 - `app.py`: eight-page light operations UI covering search, monitoring,
   price intelligence, run history, settings, and credential-free backups.
-- `scheduler.py`: production APScheduler service, timezone, process lock, and
-  heartbeat persistence.
+- `scheduler.py`: production APScheduler service, timezone, PID/start-fingerprint
+  lifetime ownership, transient provider retries, atomic heartbeat persistence,
+  and daily credential-free backup supervision.
 - `src/flight_api.py`: validation, SerpAPI adapter, and operation telemetry.
 - `src/travelpayouts.py`: cached Data API market reference for manual searches.
 - `src/api_usage.py`: monthly quota summaries, projections, and warning policy.
@@ -41,8 +44,10 @@ flowchart LR
 
 1. One durable supervisor owns fixed, daily, and interval slots; sleep/wake
    misfires cannot create a second shifted schedule.
-2. `data/scheduler.lock` prevents concurrent scheduler processes from checking
-   the same monitor set.
+2. `data/scheduler.lock` is held for the scheduler's complete process lifetime.
+   Its JSON owner includes PID, process-start fingerprint, and a random nonce;
+   stale recovery never trusts file age alone. A separate short-lived dispatch
+   lock prevents a direct legacy job from overlapping the supervisor batch.
 3. A database claim prevents concurrent delivery in the same notification
    window.
 4. A second per-channel fingerprint blocks an identical message payload even if
@@ -51,6 +56,39 @@ flowchart LR
 6. Stale `running` ledger leases are atomically reclaimed after a crash.
 
 Failed channel deliveries release their payload claim so a later run can retry.
+
+## Scheduler supervision and recovery
+
+1. One APScheduler interval tick is the only production dispatch owner for
+   global, fixed-time, daily, and interval monitor slots.
+2. A heartbeat is atomically replaced through a unique same-directory temporary
+   file before slow work, between outbox/monitor batches, before a retry, and at
+   completion. A process that loses lifetime/dispatch ownership never overwrites
+   the real owner's heartbeat, preventing false Telegram recovery messages.
+3. A fare provider or monitor-pipeline failure creates a deduplicated scheduler
+   incident and receives one short retry by default. Operators can set
+   `SCHEDULER_SHORT_RETRIES` (hard-capped at 2) and
+   `SCHEDULER_RETRY_DELAY_SECONDS` (hard-capped at 120 seconds). Quota-guard
+   skips are intentional and are never retried.
+4. `data/maintenance.lock` pauses startup and makes active ticks perform no data
+   work while a backup/restore maintenance owner is active. Startup waits before
+   acquiring the scheduler lock, then checks maintenance a second time and
+   releases/retries if it lost the race; it never waits while holding the worker
+   lock, so restore and scheduler startup cannot invert lock order.
+
+## Automatic backups
+
+- After fare work, the supervisor creates at most one full backup per Taipei
+  calendar day using `create_full_backup`, whose database snapshot uses the
+  SQLite backup API and whose ZIP allowlist contains no credentials.
+- The default due time is 03:30, output is `data/backups/skywatch-auto-YYYYMMDD.zip`,
+  and the default retention window is 14 days. Configure these with
+  `AUTO_BACKUP_ENABLED`, `AUTO_BACKUP_HOUR`, and
+  `AUTO_BACKUP_RETENTION_DAYS`.
+- Retention runs only after a same-day archive is validated or a new archive is
+  created successfully. Only validated expired automatic archives are deleted,
+  and the newest valid archive is always protected. Backup failures update the
+  scheduler status and enqueue one deduplicated daily incident without pruning.
 
 ## Fare-search and quota flow
 

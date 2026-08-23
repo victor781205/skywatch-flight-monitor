@@ -7,10 +7,12 @@ accessibility improvements, and focused feature proposals are welcome.
 
 1. Fork and clone the repository.
 2. Create a virtual environment: `python -m venv .venv`.
-3. Activate it and install dependencies: `pip install -r requirements.txt`.
+3. Activate it and install dependencies:
+   `pip install --require-hashes -r requirements-dev.lock`.
 4. Copy `.env.example` to `.env` and add only the credentials needed for the
    feature you are testing.
-5. Run `python -m unittest discover -s tests -v` before submitting a change.
+5. Run `python -m ruff check .`, the complete unittest suite, coverage gate,
+   and compile check before submitting a change.
 
 The unit tests do not send real Telegram or Discord messages. Running
 `test_telegram.py` is an explicit manual operation and requires typing `SEND`.

@@ -77,8 +77,11 @@ class MonitorTests(unittest.TestCase):
             "last_price": 17378.0,
         }
 
-        with patch("src.monitor.ALWAYS_NOTIFY", True):
-            result = check_one_monitor(monitor, scheduled_report=True)
+        with (
+            patch("src.monitor.ALWAYS_NOTIFY", True),
+            patch("src.monitor.db.get_api_usage_summary", return_value={"attempted": 0}),
+        ):
+            result = _check_one_monitor_impl(monitor, scheduled_report=True)
 
         self.assertTrue(result["notified"])
         self.assertEqual(result["notify_reason"], "sent")
@@ -133,12 +136,13 @@ class MonitorTests(unittest.TestCase):
             patch("src.monitor.get_label", side_effect=lambda code: code),
             patch("src.monitor.db.update_monitor_check"),
             patch("src.monitor.db.add_price_record"),
+            patch("src.monitor.db.get_api_usage_summary", return_value={"attempted": 0}),
             patch("src.monitor.db.recent_success_notification", return_value=None),
             patch("src.monitor.db.claim_notification", return_value=True),
             patch("src.monitor.send_all", return_value=[("Telegram", True, "ok")]),
             patch("src.monitor.ALWAYS_NOTIFY", True),
         ):
-            result = check_one_monitor(monitor)
+            result = _check_one_monitor_impl(monitor)
         self.assertFalse(result["hit"])
         return_details.assert_not_called()
         booking_details.assert_not_called()
@@ -170,12 +174,13 @@ class MonitorTests(unittest.TestCase):
             patch("src.monitor.get_label", side_effect=lambda code: code),
             patch("src.monitor.db.update_monitor_check"),
             patch("src.monitor.db.add_price_record"),
+            patch("src.monitor.db.get_api_usage_summary", return_value={"attempted": 0}),
             patch("src.monitor.db.claim_notification", return_value=True),
             patch("src.monitor.send_all", return_value=[("Telegram", True, "ok")]) as send_mock,
             patch("src.monitor.ALWAYS_NOTIFY", True),
             patch("src.monitor.MONITOR_FETCH_DETAILS_ON_HIT", True),
         ):
-            result = check_one_monitor(monitor, scheduled_report=True)
+            result = _check_one_monitor_impl(monitor, scheduled_report=True)
         self.assertFalse(result["hit"])
         return_details.assert_called_once()
         booking_details.assert_not_called()
@@ -235,12 +240,13 @@ class MonitorTests(unittest.TestCase):
             patch("src.monitor.get_label", side_effect=lambda code: code),
             patch("src.monitor.db.update_monitor_check"),
             patch("src.monitor.db.add_price_record"),
+            patch("src.monitor.db.get_api_usage_summary", return_value={"attempted": 0}),
             patch("src.monitor.db.claim_notification", return_value=True),
             patch("src.monitor.send_all", return_value=[("Telegram", True, "ok")]) as send_mock,
             patch("src.monitor.ALWAYS_NOTIFY", True),
             patch("src.monitor.MONITOR_FETCH_DETAILS_ON_HIT", True),
         ):
-            result = check_one_monitor(monitor, scheduled_report=True)
+            result = _check_one_monitor_impl(monitor, scheduled_report=True)
 
         self.assertFalse(result["hit"])
         self.assertEqual(return_details.call_count, 3)
@@ -278,13 +284,14 @@ class MonitorTests(unittest.TestCase):
             patch("src.monitor.get_label", side_effect=lambda code: code),
             patch("src.monitor.db.update_monitor_check"),
             patch("src.monitor.db.add_price_record"),
+            patch("src.monitor.db.get_api_usage_summary", return_value={"attempted": 0}),
             patch("src.monitor.db.recent_success_notification", return_value=None),
             patch("src.monitor.db.claim_notification", return_value=True),
             patch("src.monitor.send_all", return_value=[("Telegram", True, "ok")]),
             patch("src.monitor.ALWAYS_NOTIFY", True),
             patch("src.monitor.MONITOR_FETCH_DETAILS_ON_HIT", True),
         ):
-            result = check_one_monitor(monitor)
+            result = _check_one_monitor_impl(monitor)
         self.assertTrue(result["hit"])
         return_details.assert_called_once()
         booking_details.assert_called_once()

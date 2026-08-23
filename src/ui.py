@@ -14,7 +14,6 @@ from math import isfinite
 from typing import Any
 from urllib.parse import urlsplit
 
-
 _TONES = frozenset({"primary", "info", "success", "warning", "danger", "neutral"})
 _STEP_STATES = frozenset({"complete", "active", "pending", "error"})
 _RUN_STATES: dict[str, tuple[str, str, str]] = {
@@ -461,6 +460,7 @@ def monitor_card(
         gap = _finite_number(current_price) - _finite_number(target_price)
         gap_label = "低於目標" if gap <= 0 else "距離目標"
         gap_html = f'<span class="ui-monitor-card__gap">{gap_label} {_text(currency)} {abs(gap):,.0f}</span>'
+    target_gap_html = '<span class="ui-monitor-card__gap ui-monitor-card__gap--placeholder" aria-hidden="true">&nbsp;</span>' if gap_html else ""
     return (
         f'<article class="ui-monitor-card ui-monitor-card--{tone}" aria-label="{_text(origin)} 到 {_text(destination)} 航班監控">'
         '<div class="ui-monitor-card__main"><div class="ui-monitor-card__route-row">'
@@ -469,7 +469,7 @@ def monitor_card(
         f'<div class="ui-monitor-card__dates">{trip_dates}</div>{conditions_html}</div>'
         '<div class="ui-monitor-card__prices">'
         f'<div><span>目前票價</span><strong>{current_html}</strong>{gap_html}</div>'
-        f'<div><span>目標價</span><strong>{target_html}</strong></div></div></article>'
+        f'<div><span>目標價</span><strong>{target_html}</strong>{target_gap_html}</div></div></article>'
     )
 
 

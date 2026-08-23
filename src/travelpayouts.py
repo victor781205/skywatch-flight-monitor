@@ -12,7 +12,6 @@ import requests
 
 from .config import TRAVELPAYOUTS_TOKEN
 
-
 CALENDAR_URL = "https://api.travelpayouts.com/v1/prices/calendar"
 
 

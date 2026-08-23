@@ -6,6 +6,34 @@ SkyWatch 的重要變更記錄於此。版本編號遵循 [Semantic Versioning](
 
 - 尚無。
 
+## [3.1.0] - 2026-08-23
+
+### Added
+
+- 三個 Windows 使用者層級排程工作安裝器，具備單例、登入啟動與失敗重啟設定。
+- 每日不含憑證的完整備份、保留天數清理、備份失敗事件與 dashboard 執行統計。
+- Python 3.10／3.12、Windows／Linux CI 矩陣，以及 Ruff、coverage、compile gates 與含 hash 的通用依賴鎖檔。
+
+### Changed
+
+- 全站統一為同一套淺色設計系統；八頁桌面及行動導覽、資料表、狀態卡與錯誤回饋全面重整。
+- Telegram 群組指令同時驗證 chat 與 sender user allowlist；指令服務與 UI 以 PID 加程序啟動指紋判定真實存活狀態。
+- 每月額度預估改為從現在至月底的實際剩餘排程時段，並加入原子配額保留與結算。
+- 備份復原改以 maintenance lock 協調服務，嚴格驗證 schema，且隔離未完成的 runtime 狀態。
+
+### Fixed
+
+- 修正 scheduler／Telegram 多程序、PID 重用、睡眠漏跑及 heartbeat 原子寫入競態。
+- 修正暫停、刪除或修改監控時，舊 worker 仍可能寫入價格或送出已認領通知的競態。
+- Telegram timeout 不再自動重送可能已成功的訊息；保存 provider message ID／receipt，429 依服務端時限退避。
+- 啟動時自動回收逾期的 `running` run 與 lease，避免崩潰紀錄永久阻擋後續排程。
+- 修正排程設定未變更卻重算下次執行、UI Arrow 混合型別錯誤、未定義目標價與手機導覽截斷。
+
+### Security
+
+- 強化 `.gitignore` 的憑證、資料庫、備份及 runtime artifact 規則；CI 僅以最小唯讀權限執行。
+- 通知 outbox、monitor run 與 API 配額採交易鎖及 fencing token，過期 owner 無法完成寫入。
+
 ## [3.0.0] - 2026-08-13
 
 ### Added

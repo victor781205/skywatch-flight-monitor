@@ -8,19 +8,114 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from . import database as db
-from .config import SERPAPI_API_KEY
+from .config import SERPAPI_API_KEY, SERPAPI_MONTHLY_LIMIT
 
 
 class FlightAPIError(Exception):
-    pass
+    def __init__(self, message: str, *, retry_after: Optional[float] = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
-def _record_usage(provider: str, operation: str, success: bool, detail: str = "") -> None:
+def _retry_after_seconds(response: Any, document: Any = None) -> Optional[float]:
+    values: List[Any] = []
+    if isinstance(document, dict):
+        values.extend(
+            (
+                (document.get("parameters") or {}).get("retry_after")
+                if isinstance(document.get("parameters"), dict)
+                else None,
+                document.get("retry_after"),
+            )
+        )
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        try:
+            values.append(headers.get("Retry-After"))
+        except AttributeError:
+            pass
+    for value in values:
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _request_serpapi(operation: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Reserve quota, issue exactly one request, then reconcile atomically."""
     try:
-        db.record_api_usage(provider, operation, success=success, detail=detail)
-    except Exception:
-        # Usage telemetry must never break fare searches.
-        pass
+        reservation = db.reserve_api_quota_request(
+            "serpapi", operation, SERPAPI_MONTHLY_LIMIT
+        )
+    except Exception as exc:
+        raise FlightAPIError("無法安全保留 SerpAPI 額度，已取消查價") from exc
+    if not reservation.get("allowed"):
+        raise FlightAPIError("本月 SerpAPI 免費額度已用完，已取消查價")
+
+    token = str(reservation["token"])
+    attempted = False
+    success = False
+    detail = "request_not_started"
+    try:
+        attempted = True
+        response = requests.get(
+            "https://serpapi.com/search", params=params, timeout=60
+        )
+        try:
+            document = response.json()
+        except ValueError as exc:
+            detail = "invalid_json"
+            raise FlightAPIError("SerpAPI 回傳了無法解析的資料") from exc
+
+        status_value = getattr(response, "status_code", 200)
+        status = status_value if isinstance(status_value, int) else 200
+        if status >= 400:
+            detail = f"http_{status}"
+            retry_after = _retry_after_seconds(response, document) if status == 429 else None
+            raise FlightAPIError(
+                f"SerpAPI 回應失敗（HTTP {status}）", retry_after=retry_after
+            )
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            status = (
+                exc.response.status_code if exc.response is not None else "未知"
+            )
+            detail = f"http_{status}"
+            retry_after = (
+                _retry_after_seconds(exc.response, document)
+                if status == 429 and exc.response is not None
+                else None
+            )
+            raise FlightAPIError(
+                f"SerpAPI 回應失敗（HTTP {status}）", retry_after=retry_after
+            ) from exc
+        if not isinstance(document, dict):
+            detail = "invalid_document"
+            raise FlightAPIError("SerpAPI 回傳了無法解析的資料")
+        if "error" in document:
+            detail = str(document["error"])[:160]
+            raise FlightAPIError(str(document["error"]))
+        success = True
+        detail = "ok"
+        return document
+    except requests.Timeout as exc:
+        detail = "timeout"
+        raise FlightAPIError("SerpAPI 回應逾時，請稍後再試") from exc
+    except requests.RequestException as exc:
+        detail = "connection"
+        raise FlightAPIError("SerpAPI 連線失敗，請檢查網路後再試") from exc
+    finally:
+        try:
+            db.reconcile_api_quota_request(
+                token,
+                attempted=attempted,
+                success=success,
+                detail=detail,
+            )
+        except Exception as exc:
+            raise FlightAPIError("SerpAPI 額度記帳失敗，已停止後續查價") from exc
 
 
 def _validate_search(
@@ -89,29 +184,7 @@ def search_flights(
     if return_date:
         params["return_date"] = return_date
 
-    try:
-        resp = requests.get("https://serpapi.com/search", params=params, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.Timeout as exc:
-        _record_usage("serpapi", "flight_search", False, "timeout")
-        raise FlightAPIError("SerpAPI 回應逾時，請稍後再試") from exc
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "未知"
-        _record_usage("serpapi", "flight_search", False, f"http_{status}")
-        raise FlightAPIError(f"SerpAPI 回應失敗（HTTP {status}）") from exc
-    except requests.RequestException as exc:
-        _record_usage("serpapi", "flight_search", False, "connection")
-        raise FlightAPIError("SerpAPI 連線失敗，請檢查網路後再試") from exc
-    except ValueError as exc:
-        _record_usage("serpapi", "flight_search", False, "invalid_json")
-        raise FlightAPIError("SerpAPI 回傳了無法解析的資料") from exc
-
-    if "error" in data:
-        _record_usage("serpapi", "flight_search", False, str(data["error"]))
-        raise FlightAPIError(str(data["error"]))
-
-    _record_usage("serpapi", "flight_search", True)
+    data = _request_serpapi("flight_search", params)
 
     flights = _parse_flights(data, max_results=max_results)
     best_price = flights[0]["price"] if flights else None
@@ -147,9 +220,9 @@ def get_return_flight_info(
     if not SERPAPI_API_KEY:
         return None
     try:
-        resp = requests.get(
-            "https://serpapi.com/search",
-            params={
+        data = _request_serpapi(
+            "return_details",
+            {
                 "engine": "google_flights",
                 "departure_token": departure_token,
                 "departure_id": origin,
@@ -163,14 +236,7 @@ def get_return_flight_info(
                 "gl": gl,
                 "api_key": SERPAPI_API_KEY,
             },
-            timeout=60,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        if "error" in data:
-            _record_usage("serpapi", "return_details", False, str(data["error"]))
-            return None
-        _record_usage("serpapi", "return_details", True)
         flights = _parse_flights(data, max_results=30)
         if flights:
             if keywords:
@@ -184,9 +250,8 @@ def get_return_flight_info(
                     if target_airline.lower() in f_air or f_air in target_airline.lower():
                         return f
             return flights[0]
-    except Exception as exc:
-        _record_usage("serpapi", "return_details", False, type(exc).__name__)
-    return None
+    except FlightAPIError:
+        return None
 
 
 def _parse_flights(data: Dict[str, Any], max_results: int = 10) -> List[Dict[str, Any]]:
@@ -302,13 +367,7 @@ def get_booking_provider(
         if return_date:
             params["return_date"] = return_date
 
-        resp = requests.get("https://serpapi.com/search", params=params, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        if "error" in data:
-            _record_usage("serpapi", "booking_options", False, str(data["error"]))
-            return None
-        _record_usage("serpapi", "booking_options", True)
+        data = _request_serpapi("booking_options", params)
         opts = data.get("booking_options") or []
         if opts:
             first_opt = opts[0]
@@ -320,9 +379,8 @@ def get_booking_provider(
                 return f"{dep_provider} / {ret_provider}"
             elif first_opt.get("departing"):
                 return first_opt["departing"].get("book_with")
-    except Exception as exc:
-        _record_usage("serpapi", "booking_options", False, type(exc).__name__)
-    return None
+    except FlightAPIError:
+        return None
 
 
 def format_flight_summary(result: Dict[str, Any]) -> str:

@@ -8,10 +8,11 @@ from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from . import database as db
-from .api_usage import maybe_send_quota_warnings
 from .airports import get_label
+from .api_usage import maybe_send_quota_warnings
 from .config import (
     ALWAYS_NOTIFY,
+    DATA_DIR,
     MONITOR_FETCH_DETAILS_ON_HIT,
     NOTIFY_COOLDOWN_HOURS,
     SERPAPI_MONTHLY_LIMIT,
@@ -19,7 +20,6 @@ from .config import (
 from .flight_api import (
     FlightAPIError,
     dump_result_json,
-    format_flight_summary,
     get_booking_provider,
     get_return_flight_info,
     search_flights,
@@ -33,6 +33,7 @@ from .policies import (
     QuotaPolicy,
     normalize_airline,
 )
+from .runtime_lock import maintenance_active
 
 
 def clean_time(t_str: str) -> str:
@@ -65,12 +66,13 @@ def _notification_claim_scope(
     *,
     scheduled_report: bool,
     run_id: Optional[str],
+    scheduled_slot: Optional[str] = None,
     now: datetime,
     message: str = "",
 ) -> str:
     """Return a durable scheduled scope or an exact-payload manual scope."""
     if scheduled_report:
-        scheduled_identity = run_id or now.strftime("%Y-%m-%d-%H-%M")
+        scheduled_identity = scheduled_slot or run_id or now.strftime("%Y-%m-%d-%H-%M")
         return f"scheduled:{scheduled_identity}"
     if message.strip():
         payload = hashlib.sha256(message.strip().encode("utf-8")).hexdigest()
@@ -122,8 +124,23 @@ def _check_one_monitor_impl(
     save_history: bool = True,
     scheduled_report: bool = False,
     run_id: Optional[str] = None,
+    delivery_scope: Optional[str] = None,
+    lease_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """檢查單一監控項目，回傳結果摘要"""
+    if maintenance_active(DATA_DIR):
+        return {
+            "monitor_id": int(monitor.get("id") or 0),
+            "run_id": run_id,
+            "ok": False,
+            "skipped": True,
+            "error": "系統正在維護或復原，已安全取消查價",
+            "error_stage": "maintenance",
+            "notified": False,
+            "skipped_notify": True,
+            "notify_reason": "maintenance_active",
+            "quota_calls_used": 0,
+        }
     origin = monitor["origin"]
     destination = monitor["destination"]
     outbound_date = monitor["outbound_date"]
@@ -138,6 +155,20 @@ def _check_one_monitor_impl(
     request_budget = _RequestBudget(quota_max_calls)
     notification_policy = str(monitor.get("notification_policy") or "always").lower()
 
+    def assert_owner() -> None:
+        if run_id and lease_token:
+            db.assert_monitor_run_lease(monitor_id, run_id, lease_token)
+
+    ownership = (
+        {
+            "monitor_id": monitor_id,
+            "run_id": run_id,
+            "lease_token": lease_token,
+        }
+        if run_id and lease_token
+        else {}
+    )
+
     try:
         usage = db.get_api_usage_summary("serpapi", SERPAPI_MONTHLY_LIMIT)
         quota_guard = QuotaPolicy(
@@ -145,7 +176,20 @@ def _check_one_monitor_impl(
             monthly_limit=SERPAPI_MONTHLY_LIMIT,
         ).guard(int(usage["attempted"]), requested=quota_max_calls)
     except Exception:
-        quota_guard = None
+        return {
+            "monitor_id": monitor_id,
+            "run_id": run_id,
+            "ok": False,
+            "skipped": True,
+            "error": "無法讀取 API 額度帳本，已安全取消查價",
+            "error_stage": "quota_ledger",
+            "notified": False,
+            "skipped_notify": True,
+            "notify_reason": "quota_ledger_unavailable",
+            "quota_mode": quota_mode,
+            "quota_max_calls": quota_max_calls,
+            "quota_calls_used": 0,
+        }
     if quota_guard is not None and not quota_guard.allowed:
         return {
             "monitor_id": monitor_id,
@@ -179,11 +223,21 @@ def _check_one_monitor_impl(
             max_results=30 if quota_mode == "full" else 15 if quota_mode == "standard" else 10,
         )
     except FlightAPIError as e:
-        db.update_monitor_check(monitor_id, monitor.get("last_price"))
+        assert_owner()
+        db.update_monitor_check(
+            monitor_id,
+            monitor.get("last_price"),
+            **(
+                {"run_id": run_id, "lease_token": lease_token}
+                if run_id and lease_token
+                else {}
+            ),
+        )
         return {
             "monitor_id": monitor_id,
             "ok": False,
             "error": str(e),
+            "error_stage": "flight_search",
             "quota_mode": quota_mode,
             "quota_max_calls": quota_max_calls,
             "quota_calls_used": request_budget.used,
@@ -193,7 +247,16 @@ def _check_one_monitor_impl(
         }
 
     best = result.get("best_price")
-    db.update_monitor_check(monitor_id, best)
+    assert_owner()
+    db.update_monitor_check(
+        monitor_id,
+        best,
+        **(
+            {"run_id": run_id, "lease_token": lease_token}
+            if run_id and lease_token
+            else {}
+        ),
+    )
 
     if save_history and best is not None and result.get("flights"):
         top = result["flights"][0]
@@ -211,6 +274,7 @@ def _check_one_monitor_impl(
             flight_number=top.get("flight_number", ""),
             raw_json=dump_result_json(result),
             travel_class=travel_class,
+            **ownership,
         )
 
     notified = False
@@ -519,7 +583,7 @@ def _check_one_monitor_impl(
                 msg += f"航空公司專屬目標已達標：{', '.join(dict.fromkeys(carrier_hits))}\n"
             msg += "\n"
             msg += f"{top_msg}\n"
-            msg += f"🏆 【三大國籍航空】\n\n"
+            msg += "🏆 【三大國籍航空】\n\n"
             msg += "\n".join(pure_blocks) + "\n\n"
             source_name = "Google Flights / SerpAPI"
             if not hit:
@@ -528,6 +592,11 @@ def _check_one_monitor_impl(
                 else:
                     msg += "額度節省模式：固定排程或達標時才補查回程。\n"
             msg += f"資料來源：{source_name}。下單前請再次確認最終價格。"
+
+            # Return/booking enrichment above may have yielded the process for
+            # minutes. Revalidate ownership immediately before any durable
+            # notification is created or sent.
+            assert_owner()
 
             if decision.queue_digest:
                 due, deferred_scope = _deferred_delivery(
@@ -545,6 +614,7 @@ def _check_one_monitor_impl(
                     dedupe_scope=deferred_scope,
                     next_attempt_at=due,
                     replace_pending=True,
+                    run_lease_token=lease_token,
                 )
                 notify_results = [
                     (
@@ -563,6 +633,7 @@ def _check_one_monitor_impl(
                 claim_scope = _notification_claim_scope(
                     scheduled_report=scheduled_report,
                     run_id=run_id,
+                    scheduled_slot=delivery_scope,
                     now=notification_now,
                     message=msg,
                 )
@@ -593,10 +664,17 @@ def _check_one_monitor_impl(
                             dedupe_scope=digest_scope,
                             next_attempt_at=notification_now.replace(tzinfo=None),
                             replace_pending=True,
+                            run_lease_token=lease_token,
                         )
                     else:
                         notify_results = (
-                            send_all_reliable(msg, monitor_id=monitor_id, run_id=run_id)
+                            send_all_reliable(
+                                msg,
+                                monitor_id=monitor_id,
+                                run_id=run_id,
+                                dedupe_scope=claim_scope,
+                                run_lease_token=lease_token,
+                            )
                             if run_id
                             else send_all(msg, monitor_id=monitor_id)
                         )
@@ -608,7 +686,7 @@ def _check_one_monitor_impl(
                     notify_reason = (
                         "sent" if notified else "deduplicated" if duplicate_suppressed else "delivery_failed"
                     )
-                    if not notified:
+                    if not notified and not run_id:
                         db.release_notification_claim(dedupe_key)
 
     quote_candidates: List[Dict[str, Any]] = []
@@ -666,11 +744,13 @@ def _check_one_monitor_impl(
             }
         )
     try:
+        assert_owner()
         db.save_carrier_quotes(
             route_id=route_id,
             monitor_id=monitor_id,
             run_id=run_id,
             quotes=quotes,
+            run_lease_token=lease_token,
         )
     except Exception:
         # Price checks must still return if an old/test database has not yet
@@ -708,6 +788,18 @@ def check_one_monitor(
 ) -> Dict[str, Any]:
     """Run one monitor with an idempotent, query-counted audit ledger."""
     monitor_id = int(monitor["id"])
+    if maintenance_active(DATA_DIR):
+        return {
+            "monitor_id": monitor_id,
+            "ok": False,
+            "skipped": True,
+            "error": "系統正在維護或復原，已安全取消查價",
+            "error_stage": "maintenance",
+            "notified": False,
+            "skipped_notify": True,
+            "notify_reason": "maintenance_active",
+            "quota_calls_used": 0,
+        }
     try:
         run = db.create_check_run(
             monitor_id,
@@ -715,15 +807,20 @@ def check_one_monitor(
             scheduled_slot=scheduled_slot,
             backfill=backfill,
         )
-    except Exception:
-        # Preserve the reusable domain function for isolated tests and legacy
-        # callers; production startup always migrates before executing jobs.
-        return _check_one_monitor_impl(
-            monitor,
-            save_history=save_history,
-            scheduled_report=scheduled_report,
-            run_id=None,
-        )
+    except Exception as exc:
+        # Ledger creation is a safety boundary. Never spend provider quota
+        # when ownership cannot be recorded durably.
+        return {
+            "monitor_id": monitor_id,
+            "ok": False,
+            "skipped": True,
+            "error": f"無法建立查價執行帳本：{type(exc).__name__}",
+            "error_stage": "run_ledger",
+            "notified": False,
+            "skipped_notify": True,
+            "notify_reason": "run_ledger_unavailable",
+            "quota_calls_used": 0,
+        }
     if not run.get("created"):
         return {
             "monitor_id": monitor_id,
@@ -743,6 +840,8 @@ def check_one_monitor(
             save_history=save_history,
             scheduled_report=scheduled_report,
             run_id=run_id,
+            delivery_scope=scheduled_slot,
+            lease_token=str(run.get("lease_token") or ""),
         )
         after = db.get_api_usage_summary("serpapi", SERPAPI_MONTHLY_LIMIT)["attempted"]
         api_calls = max(0, int(after) - int(before))
@@ -789,18 +888,25 @@ def check_one_monitor(
                 "notified": result.get("notified"),
                 "notify_reason": result.get("notify_reason"),
             },
+            lease_token=str(run.get("lease_token") or ""),
         )
-        db.set_monitor_next_run(monitor_id, monitor.get("next_run_at"), run_id=run_id)
         return result
     except Exception as exc:
         after = db.get_api_usage_summary("serpapi", SERPAPI_MONTHLY_LIMIT)["attempted"]
-        db.finish_check_run(
-            run_id,
-            status="failed",
-            api_calls=max(0, int(after) - int(before)),
-            error_stage="monitor_pipeline",
-            error_message=str(exc),
-        )
+        try:
+            db.finish_check_run(
+                run_id,
+                status="failed",
+                api_calls=max(0, int(after) - int(before)),
+                error_stage="monitor_pipeline",
+                error_message=str(exc),
+                lease_token=str(run.get("lease_token") or ""),
+            )
+        except (PermissionError, RuntimeError):
+            # Pause/delete/policy changes deliberately revoke ownership. The
+            # transaction that revoked it already closed the run and cancelled
+            # queued notifications; the stale worker must not overwrite that.
+            pass
         raise
 
 
@@ -839,6 +945,8 @@ def search_and_save(
     travel_class: int = 1,
 ) -> Dict[str, Any]:
     """儀表板即時查詢並寫入歷史"""
+    if maintenance_active(DATA_DIR):
+        raise FlightAPIError("系統正在維護或復原，已安全取消查價")
     origin_name = get_label(origin.upper())
     dest_name = get_label(destination.upper())
     route_id = db.upsert_route(origin, destination, origin_name, dest_name)

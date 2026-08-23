@@ -1,11 +1,35 @@
 [tool.ruff]
-target-version = "py312"
+target-version = "py310"
 line-length = 110
-exclude = ["data", "__pycache__"]
+exclude = ["data", "legacy", "__pycache__"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/download_airports.py" = ["E402"]
+
+[tool.coverage.run]
+branch = true
+source = ["src", "scheduler", "telegram_bot"]
+omit = [
+    "tests/*",
+    "legacy/*",
+    "data/*",
+    # Streamlit's imperative render tree is covered by static regression tests
+    # plus desktop/mobile browser smoke tests; this gate targets runtime logic.
+    "src/ui.py",
+]
+
+[tool.coverage.report]
+fail_under = 55
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

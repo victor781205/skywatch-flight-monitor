@@ -8,12 +8,11 @@ from __future__ import annotations
 
 import calendar
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from enum import Enum
 from typing import Any, Iterable, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
 
 TAIPEI_TIMEZONE = "Asia/Taipei"
 

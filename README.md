@@ -8,7 +8,7 @@ SkyWatch 是一套 local-first、可自行託管的航班票價監控工具。�
 
 > SkyWatch 是獨立開源專案。票價與航班資料可能延遲、不完整或不正確；訂票前請務必在航空公司或訂位服務商頁面確認最終行程、票價、行李與退改條件。
 
-## 3.0.0 重點功能
+## 3.1.0 重點功能
 
 - 統一淺色主題的響應式營運介面，不混用深色元件。
 - 搜尋單程與來回票價，並在 SQLite 保留查價歷史。
@@ -71,7 +71,7 @@ python telegram_bot.py
 - `/quota`：顯示本月使用量與預估。
 - `/check`：先回報保守成本並產生短效一次性確認碼；確認後才執行全部查價。
 
-服務會在執行 update 前持久化 Telegram offset，並使用 allowlist、單例鎖與退避重試。它也會獨立監測 scheduler heartbeat：超過設定時間未更新會主動發送異常通知，恢復後再回報；每個允許的 chat 都會分別記錄送達，暫時性失敗只重送尚未成功的收件人。因此即使 scheduler 整個停止也能告警。Windows 可使用 `start_telegram_bot.bat` 或 `start_telegram_bot_silent.vbs`。
+服務會在執行 update 前持久化 Telegram offset，並使用 allowlist、單例鎖與退避重試。私人聊天室會驗證 chat ID；群組與超級群組會同時驗證 chat ID 及 `TELEGRAM_ALLOWED_USER_IDS`，避免群組內其他成員執行管理指令。它也會獨立監測 scheduler heartbeat：超過設定時間未更新會主動發送異常通知，恢復後再回報；每個允許的 chat 都會分別記錄送達，暫時性失敗只重送尚未成功的收件人。因此即使 scheduler 整個停止也能告警。Windows 可使用 `start_telegram_bot.bat` 或 `start_telegram_bot_silent.vbs`。
 
 ## Flight-data providers
 
@@ -109,7 +109,7 @@ source .venv/bin/activate
 安裝相依套件並建立設定檔：
 
 ```bash
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock
 cp .env.example .env
 ```
 
@@ -128,11 +128,18 @@ TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 # 多個允許的 chat ID 可使用逗號分隔；設定後會覆蓋單一 TELEGRAM_CHAT_ID allowlist
 TELEGRAM_ALLOWED_CHAT_IDS=123456789,-987654321
+# 群組／超級群組必填，可下指令的 Telegram user ID
+TELEGRAM_ALLOWED_USER_IDS=123456789
 TELEGRAM_COMMANDS_ENABLED=true
 
 ALWAYS_NOTIFY=true
 SCHEDULE_HOURS=0,12
 CHECK_INTERVAL_MINUTES=
+SCHEDULER_SHORT_RETRIES=1
+SCHEDULER_RETRY_DELAY_SECONDS=30
+AUTO_BACKUP_ENABLED=true
+AUTO_BACKUP_HOUR=03:30
+AUTO_BACKUP_RETENTION_DAYS=14
 ```
 
 啟動網頁應用：
@@ -149,11 +156,19 @@ python scheduler.py
 
 Windows 也可使用 `start_skywatch.bat`、`start_scheduler.bat` 及對應的靜默 `.vbs` 啟動器。Web 程序不會自行啟動第二份 scheduler。
 
+要讓三個服務在登入 Windows 後自動啟動，於 PowerShell 執行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install_windows_tasks.ps1
+```
+
+安裝器會註冊 Web、scheduler 與 Telegram bot 三個使用者層級工作，限制同一服務只能有一個實例，異常退出後自動重啟。
+
 ## 備份與復原
 
 備份 ZIP 只包含應用資料白名單，例如 SQLite snapshot 與監控設定 JSON；不包含 `.env`、API key、bot token、webhook 或其他整合憑證。匯入支援跳過、更新或複製衝突監控。復原前會建立 restore point、檢查 hash 與路徑安全，且操作介面要求明確確認。
 
-復原資料庫前應先停止 scheduler 與 Telegram bot，完成後再重新啟動服務。備份檔可能包含個人旅行偏好與價格紀錄，請視為敏感資料妥善保存。
+復原流程會取得 maintenance lock、拒絕仍有活躍 worker 的操作、驗證 schema 與 hash、先建立 restore point，並將復原檔內未完成的 run、lease、配額保留及通知派送安全隔離。備份檔可能包含個人旅行偏好與價格紀錄，請視為敏感資料妥善保存。
 
 ## Airport data
 
@@ -168,7 +183,11 @@ python scripts/download_airports.py
 ## Testing
 
 ```bash
+pip install --require-hashes -r requirements-dev.lock
+python -m ruff check .
 python -m unittest discover -s tests -v
+python -m coverage run -m unittest discover -s tests -v
+python -m coverage report --fail-under=55 --show-missing
 python -m compileall -q app.py scheduler.py telegram_bot.py src tests
 ```
 
@@ -197,7 +216,9 @@ skywatch-flight-monitor/
 ├── scheduler.py             # 排程與漏跑補跑服務
 ├── telegram_bot.py          # Telegram 指令 long-polling 服務
 ├── style.css                # 統一淺色設計系統
-└── requirements.txt
+├── requirements.txt         # 可讀的直接相依版本範圍
+├── requirements.lock        # 可重現、含 hash 的正式環境鎖檔
+└── requirements-dev.lock    # 可重現、含 hash 的開發／CI 鎖檔
 ```
 
 ## Contributing

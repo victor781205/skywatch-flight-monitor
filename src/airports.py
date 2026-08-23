@@ -10,7 +10,7 @@ import io
 import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import requests
 
@@ -131,13 +131,11 @@ ZH_ALIASES: Dict[str, str] = {
     "DXB": "杜拜",
     "AUH": "阿布達比",
     "DOH": "杜哈",
-    "SIN": "新加坡",
     "SYD": "雪梨",
     "MEL": "墨爾本",
     "BNE": "布里斯本",
     "AKL": "奧克蘭",
     "CHC": "基督城",
-    "NRT": "東京成田",
 }
 
 

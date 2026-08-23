@@ -11,27 +11,30 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from zoneinfo import ZoneInfo
-
-ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from src import database as db
-from src.config import MISSED_RUN_LOOKBACK_HOURS, SCHEDULER_TICK_MINUTES
+from src.backup import create_full_backup, inspect_backup
+from src.config import DB_PATH, MISSED_RUN_LOOKBACK_HOURS, SCHEDULER_TICK_MINUTES
 from src.monitor import check_all_monitors
 from src.notifier import process_notification_outbox, send_all_reliable
 from src.policies import ScheduleMode, SchedulePolicy
+from src.runtime_lock import ProcessLock, maintenance_active
 
-LOCK_FILE = ROOT / "data" / "scheduler.lock"
-STATUS_FILE = ROOT / "data" / "scheduler_status.json"
-LOCK_STALE_SECONDS = 30 * 60
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+DISPATCH_LOCK_FILE = DATA_DIR / "scheduler-dispatch.lock"
+STATUS_FILE = DATA_DIR / "scheduler_status.json"
+_STATUS_WRITE_LOCK = threading.Lock()
+_AUTO_BACKUP_LAST_TARGET: Optional[Path] = None
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
 
@@ -42,16 +45,40 @@ def _now() -> datetime:
 def _write_status(**updates) -> None:
     """Persist a machine-readable heartbeat without exposing secrets."""
     STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    current = {}
-    try:
-        current = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, ValueError):
-        pass
-    current.update(updates)
-    current["updated_at"] = _now().isoformat(timespec="seconds")
-    temp_path = STATUS_FILE.with_suffix(".tmp")
-    temp_path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(STATUS_FILE)
+    # A fixed ``scheduler_status.tmp`` lets two close writes replace/unlink the
+    # same temporary file.  One in-process mutex plus a unique same-directory
+    # file keeps read/merge/replace atomic for the service and for Windows.
+    with _STATUS_WRITE_LOCK:
+        current = {}
+        try:
+            current = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError):
+            pass
+        current.update(updates)
+        current["updated_at"] = _now().isoformat(timespec="seconds")
+        temp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(STATUS_FILE.parent),
+                prefix=f".{STATUS_FILE.name}.{os.getpid()}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temp_file:
+                temp_path = Path(temp_file.name)
+                json.dump(current, temp_file, ensure_ascii=False, indent=2)
+                temp_file.write("\n")
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+            os.replace(temp_path, STATUS_FILE)
+            temp_path = None
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
 
 
 def log_message(msg: str):
@@ -77,39 +104,6 @@ def log_message(msg: str):
             f.write(full_msg + "\n")
     except Exception:
         pass
-
-
-def _acquire_job_lock() -> Optional[int]:
-    """Acquire one cross-process lock; stale locks are recovered automatically."""
-    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    for attempt in range(2):
-        try:
-            fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, f"pid={os.getpid()} started={_now().isoformat()}".encode("utf-8"))
-            return fd
-        except FileExistsError:
-            try:
-                stale = time.time() - LOCK_FILE.stat().st_mtime > LOCK_STALE_SECONDS
-            except FileNotFoundError:
-                stale = False
-            if attempt == 0 and stale:
-                try:
-                    LOCK_FILE.unlink()
-                except FileNotFoundError:
-                    pass
-                continue
-            return None
-    return None
-
-
-def _release_job_lock(fd: int) -> None:
-    try:
-        os.close(fd)
-    finally:
-        try:
-            LOCK_FILE.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def _slot_key(moment: datetime) -> str:
@@ -317,18 +311,309 @@ def detect_missed_slots(
 
 
 def _send_scheduler_incident(title: str, detail: str, incident_key: str) -> None:
-    send_all_reliable(
-        f"⚠️ SkyWatch 排程異常\n{title}\n{detail}\n時間：{_now().strftime('%Y-%m-%d %H:%M')}（台北）",
-        purpose=f"scheduler:{incident_key}",
+    """Queue a durable scheduler incident without letting alerts stop work."""
+    try:
+        send_all_reliable(
+            f"⚠️ SkyWatch 排程異常\n{title}\n{detail}\n時間：{_now().strftime('%Y-%m-%d %H:%M')}（台北）",
+            purpose=f"scheduler:{incident_key}",
+            dedupe_scope=incident_key,
+        )
+    except Exception as exc:
+        # A database/network outage may affect both the fare pipeline and the
+        # incident channel.  Preserve the original failure and let the durable
+        # supervisor try the outbox again on its next tick.
+        log_message(f"排程異常通知建立失敗：{type(exc).__name__}")
+
+
+def _retry_policy() -> tuple[int, float]:
+    """Return a deliberately small transient-failure retry budget.
+
+    One retry is enough to absorb a short provider timeout without allowing a
+    bad upstream to consume the free monthly quota in a tight loop.  Operators
+    may tune it, but hard caps remain enforced here.
+    """
+
+    try:
+        retries = int(os.getenv("SCHEDULER_SHORT_RETRIES", "1"))
+    except ValueError:
+        retries = 1
+    try:
+        delay = float(os.getenv("SCHEDULER_RETRY_DELAY_SECONDS", "30"))
+    except ValueError:
+        delay = 30.0
+    return min(2, max(0, retries)), min(120.0, max(1.0, delay))
+
+
+def _auto_backup_settings() -> tuple[bool, int, int, int]:
+    enabled = os.getenv("AUTO_BACKUP_ENABLED", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    raw_hour = os.getenv("AUTO_BACKUP_HOUR", "03:30").strip() or "03:30"
+    try:
+        if ":" in raw_hour:
+            hour_text, minute_text = raw_hour.split(":", 1)
+            hour, minute = int(hour_text), int(minute_text)
+        else:
+            hour, minute = int(raw_hour), 0
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            raise ValueError
+    except ValueError:
+        hour, minute = 3, 30
+    try:
+        retention = int(os.getenv("AUTO_BACKUP_RETENTION_DAYS", "14"))
+    except ValueError:
+        retention = 14
+    return enabled, hour, minute, min(365, max(1, retention))
+
+
+def _auto_backup_date(path: Path):
+    name = path.name
+    prefix, suffix = "skywatch-auto-", ".zip"
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return None
+    stamp = name[len(prefix) : -len(suffix)]
+    if len(stamp) != 8 or not stamp.isdigit():
+        return None
+    try:
+        return datetime.strptime(stamp, "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def _prune_auto_backups(
+    backup_dir: Path,
+    *,
+    current: datetime,
+    retention_days: int,
+    newest_valid: Path,
+) -> list[Path]:
+    """Delete only verified, expired auto archives and always keep the newest."""
+
+    valid: list[tuple[Path, object]] = []
+    for path in backup_dir.glob("skywatch-auto-*.zip"):
+        backup_date = _auto_backup_date(path)
+        if backup_date is None:
+            continue
+        if path != newest_valid:
+            try:
+                inspect_backup(path)
+            except Exception:
+                # Unknown/corrupt files are left for explicit operator review;
+                # retention must never guess and delete the latest valid copy.
+                continue
+        valid.append((path, backup_date))
+    if not valid:
+        return []
+    protected = max(valid, key=lambda item: (item[1], item[0].name))[0]
+    cutoff = current.date() - timedelta(days=max(1, retention_days) - 1)
+    removed: list[Path] = []
+    for path, backup_date in valid:
+        if path == protected or backup_date >= cutoff:
+            continue
+        try:
+            path.unlink()
+            removed.append(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log_message(f"舊自動備份清理失敗：{path.name} ({type(exc).__name__})")
+    return removed
+
+
+def _maybe_create_auto_backup(
+    *,
+    now: Optional[datetime] = None,
+    backup_dir: Optional[Path] = None,
+    db_path: Optional[Path] = None,
+) -> dict:
+    """Create at most one credential-free full backup per Taipei calendar day."""
+
+    global _AUTO_BACKUP_LAST_TARGET
+    enabled, hour, minute, retention = _auto_backup_settings()
+    current = (now or _now()).astimezone(TAIPEI_TZ)
+    if not enabled:
+        return {"state": "disabled"}
+    if (current.hour, current.minute) < (hour, minute):
+        return {"state": "not_due"}
+
+    directory = Path(backup_dir) if backup_dir is not None else DATA_DIR / "backups"
+    database = Path(db_path) if db_path is not None else DB_PATH
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"skywatch-auto-{current.strftime('%Y%m%d')}.zip"
+    resolved_target = target.resolve()
+    if _AUTO_BACKUP_LAST_TARGET == resolved_target and target.is_file():
+        return {"state": "current", "path": str(target), "removed": 0}
+    if target.is_file():
+        try:
+            inspect_backup(target)
+            removed = _prune_auto_backups(
+                directory,
+                current=current,
+                retention_days=retention,
+                newest_valid=target,
+            )
+            _AUTO_BACKUP_LAST_TARGET = resolved_target
+            return {"state": "current", "path": str(target), "removed": len(removed)}
+        except Exception:
+            # Atomic create_full_backup safely replaces an invalid same-day
+            # artifact; older valid backups remain untouched until it succeeds.
+            pass
+
+    report = create_full_backup(target, database)
+    removed = _prune_auto_backups(
+        directory,
+        current=current,
+        retention_days=retention,
+        newest_valid=target,
     )
+    _AUTO_BACKUP_LAST_TARGET = resolved_target
+    return {
+        "state": "created",
+        "path": str(report.get("path") or target),
+        "removed": len(removed),
+    }
 
 
-def recover_missed_runs(fallback: SchedulePolicy, *, now: Optional[datetime] = None) -> list[dict]:
+def _retry_slot(slot: str, attempt: int) -> str:
+    """Give retries an auditable ledger key without reopening the failed row."""
+
+    return f"{slot}#retry-{attempt}"
+
+
+def _result_failure(results: list[dict]) -> Optional[str]:
+    """Return a retryable pipeline/API failure summary, if present."""
+
+    failures = [
+        result
+        for result in results
+        if not result.get("ok") and not result.get("skipped")
+    ]
+    if not failures:
+        return None
+    first = failures[0]
+    stage = str(first.get("error_stage") or "flight_search")
+    detail = str(first.get("error") or "unknown provider error").strip()
+    return f"{stage}: {detail}"[:360]
+
+
+def _check_monitor_with_retry(
+    monitor: dict,
+    *,
+    scheduled_slot: str,
+    backfill: bool,
+    heartbeat: Optional[Callable[..., None]] = None,
+    announce_recovery: bool = True,
+) -> list[dict]:
+    """Run one scheduled monitor and briefly retry transient pipeline errors.
+
+    Each retry has its own ledger suffix because the original slot is already
+    terminal once ``check_one_monitor`` records a provider failure.  Only this
+    invocation can emit its recovery message, so a second scheduler that loses
+    process ownership cannot misreport another process as recovered.
+    """
+
+    monitor_id = int(monitor["id"])
+    route = f"{monitor.get('origin', '?')} → {monitor.get('destination', '?')}"
+    retries, base_delay = _retry_policy()
+    failure_announced = False
+    last_results: list[dict] = []
+    last_error = ""
+
+    for attempt in range(retries + 1):
+        attempt_slot = (
+            scheduled_slot if attempt == 0 else _retry_slot(scheduled_slot, attempt)
+        )
+        if heartbeat is not None:
+            heartbeat(
+                "monitor_attempt",
+                monitor_id=monitor_id,
+                attempt=attempt + 1,
+                total_attempts=retries + 1,
+            )
+        try:
+            results = check_all_monitors(
+                scheduled_report=True,
+                scheduled_slot=attempt_slot,
+                backfill=backfill,
+                monitor_ids=[monitor_id],
+            )
+            last_results = results
+            last_error = _result_failure(results) or ""
+            # An empty result means the monitor expired or was disabled between
+            # listing and dispatch; a quota skip is intentional, not a provider
+            # retry signal.
+            if not last_error:
+                if failure_announced and announce_recovery:
+                    _send_scheduler_incident(
+                        "查價服務已恢復",
+                        f"監控 #{monitor_id} · {route}\n排程時段：{scheduled_slot}\n第 {attempt + 1} 次嘗試成功",
+                        f"pipeline-recovered:{monitor_id}:{scheduled_slot}",
+                    )
+                return results
+        except Exception as exc:
+            last_results = []
+            last_error = f"monitor_pipeline: {type(exc).__name__}: {exc}"[:360]
+
+        if not failure_announced:
+            _send_scheduler_incident(
+                "查價管線失敗，將進行短期重試",
+                f"監控 #{monitor_id} · {route}\n排程時段：{scheduled_slot}\n原因：{last_error}",
+                f"pipeline-failed:{monitor_id}:{scheduled_slot}",
+            )
+            failure_announced = True
+
+        if attempt < retries:
+            delay = min(120.0, base_delay * (attempt + 1))
+            if heartbeat is not None:
+                heartbeat(
+                    "retry_wait",
+                    monitor_id=monitor_id,
+                    attempt=attempt + 2,
+                    retry_in_seconds=delay,
+                )
+            time.sleep(delay)
+
+    _send_scheduler_incident(
+        "查價短期重試仍失敗",
+        f"監控 #{monitor_id} · {route}\n排程時段：{scheduled_slot}\n原因：{last_error}",
+        f"pipeline-exhausted:{monitor_id}:{scheduled_slot}",
+    )
+    if last_results:
+        return last_results
+    return [
+        {
+            "monitor_id": monitor_id,
+            "ok": False,
+            "error": last_error,
+            "error_stage": "scheduler_retry",
+            "notified": False,
+        }
+    ]
+
+
+def recover_missed_runs(
+    fallback: SchedulePolicy,
+    *,
+    now: Optional[datetime] = None,
+    heartbeat: Optional[Callable[..., None]] = None,
+) -> list[dict]:
     """Backfill at most one latest missed slot per monitor to protect quota."""
     recovered: list[dict] = []
     current = (now or _now()).astimezone(TAIPEI_TZ)
     incident_grace = timedelta(minutes=max(2, SCHEDULER_TICK_MINUTES * 2))
-    for monitor in db.list_monitors(active_only=True):
+    monitors = db.list_monitors(active_only=True)
+    total = len(monitors)
+    for index, monitor in enumerate(monitors, start=1):
+        if heartbeat is not None:
+            heartbeat(
+                "monitor_batch",
+                monitor_id=int(monitor["id"]),
+                batch_index=index,
+                batch_total=total,
+            )
         missed = detect_missed_slots(monitor, fallback, now=current)
         if not missed:
             _persist_next_monitor_run(monitor, fallback, after=current)
@@ -344,11 +629,12 @@ def recover_missed_runs(fallback: SchedulePolicy, *, now: Optional[datetime] = N
                 f"監控 #{monitor['id']} · {monitor['origin']} → {monitor['destination']}\n漏跑時段：{key}",
                 f"missed:{monitor['id']}:{key}",
             )
-        results = check_all_monitors(
-            scheduled_report=True,
+        results = _check_monitor_with_retry(
+            monitor,
             scheduled_slot=key,
             backfill=is_backfill,
-            monitor_ids=[int(monitor["id"])],
+            heartbeat=heartbeat,
+            announce_recovery=not is_backfill,
         )
         recovered.extend(results)
         _persist_next_monitor_run(monitor, fallback, after=current)
@@ -368,13 +654,18 @@ def job(
     backfill: bool = False,
     fallback_policy: Optional[SchedulePolicy] = None,
 ):
-    lock_fd = _acquire_job_lock()
-    if lock_fd is None:
+    if maintenance_active(DATA_DIR):
+        log_message("略過本次查價：系統正在備份或復原維護。")
+        return []
+    dispatch_lock = ProcessLock(DISPATCH_LOCK_FILE, "scheduler-dispatch")
+    if not dispatch_lock.acquire():
         log_message("略過本次查價：另一個排程工作仍在執行。")
-        _write_status(state="skipped_locked", last_skip_at=_now().isoformat(timespec="seconds"))
-        return
+        # A losing process must not overwrite the real owner's heartbeat; that
+        # previously caused a false watchdog incident/recovery pair.
+        return []
     log_message("開始執行定時查價監控…")
     _write_status(state="running", last_started_at=_now().isoformat(timespec="seconds"), last_error=None)
+    results: list[dict] = []
     try:
         slot = scheduled_slot or _slot_key(_now().replace(second=0, microsecond=0))
         slot_moment = _schedule_moment(slot) or _now()
@@ -391,12 +682,14 @@ def job(
             if str(monitor.get("schedule_type") or "global") == "global"
             or not str(monitor.get("schedule_value") or "").strip()
         ]
-        results = check_all_monitors(
-            scheduled_report=True,
-            scheduled_slot=slot,
-            backfill=backfill,
-            monitor_ids=[int(monitor["id"]) for monitor in due_monitors],
-        )
+        for monitor in due_monitors:
+            results.extend(
+                _check_monitor_with_retry(
+                    monitor,
+                    scheduled_slot=slot,
+                    backfill=backfill,
+                )
+            )
         for monitor in due_monitors:
             _persist_next_monitor_run(monitor, fallback, after=slot_moment)
         for r in results:
@@ -419,6 +712,7 @@ def job(
             last_backfill=bool(backfill),
             last_error=None,
         )
+        return results
     except Exception as e:
         log_message(f"❌ 排程執行錯誤: {e}")
         _write_status(
@@ -426,11 +720,116 @@ def job(
             last_failed_at=_now().isoformat(timespec="seconds"),
             last_error=str(e)[:240],
         )
+        _send_scheduler_incident(
+            "排程批次執行失敗",
+            f"排程時段：{scheduled_slot or '當前時段'}\n原因：{type(e).__name__}: {str(e)[:240]}",
+            f"batch:{scheduled_slot or _slot_key(_now())}",
+        )
+        return results
     finally:
-        _release_job_lock(lock_fd)
+        dispatch_lock.release()
 
 
-def main():
+def _supervisor_tick(fallback_policy: SchedulePolicy, *, owner_token: str) -> None:
+    """Run one durable dispatch/notification/heartbeat supervision batch."""
+
+    if maintenance_active(DATA_DIR):
+        # Restore/backup owns the complete data directory while this flag is
+        # active.  Do not even refresh the JSON heartbeat during that window.
+        return
+
+    dispatch_lock = ProcessLock(DISPATCH_LOCK_FILE, "scheduler-dispatch")
+    if not dispatch_lock.acquire():
+        log_message("排程監督器略過競爭批次；現有工作繼續執行。")
+        return
+
+    def heartbeat(phase: str, **details: object) -> None:
+        _write_status(
+            supervisor_state="running",
+            supervisor_phase=phase,
+            supervisor_heartbeat_at=_now().isoformat(timespec="seconds"),
+            owner_token=owner_token,
+            **details,
+        )
+
+    # The heartbeat is written before any potentially slow outbox/API work and
+    # again between monitors/retries through the callback below.
+    heartbeat("starting", batch_index=0, batch_total=0)
+    try:
+        retry_results = process_notification_outbox(limit=20)
+        heartbeat("notifications_processed", retry_count=len(retry_results))
+        recovered = recover_missed_runs(
+            fallback_policy,
+            heartbeat=heartbeat,
+        )
+        heartbeat("fare_batch_complete", recovered_count=len(recovered))
+        try:
+            backup_report = _maybe_create_auto_backup()
+            backup_state = str(backup_report.get("state") or "unknown")
+            backup_updates: dict[str, object] = {
+                "auto_backup_checked_at": _now().isoformat(timespec="seconds"),
+                "owner_token": owner_token,
+            }
+            if backup_state != "not_due":
+                backup_updates.update(
+                    {
+                        "auto_backup_state": backup_state,
+                        "auto_backup_path": backup_report.get("path"),
+                        "auto_backup_removed": backup_report.get("removed", 0),
+                    }
+                )
+            if backup_state in {"created", "current", "disabled"}:
+                backup_updates["auto_backup_error"] = None
+            _write_status(**backup_updates)
+        except Exception as backup_exc:
+            backup_report = {"state": "error"}
+            log_message(f"每日自動備份失敗：{backup_exc}")
+            _write_status(
+                auto_backup_state="error",
+                auto_backup_error=str(backup_exc)[:240],
+                auto_backup_checked_at=_now().isoformat(timespec="seconds"),
+                owner_token=owner_token,
+            )
+            _send_scheduler_incident(
+                "每日自動備份失敗",
+                f"原因：{type(backup_exc).__name__}: {str(backup_exc)[:240]}\n現有最新有效備份已保留，未執行清理。",
+                f"auto-backup:{_now().strftime('%Y-%m-%d')}",
+            )
+        heartbeat(
+            "finalizing",
+            recovered_count=len(recovered),
+            auto_backup_state=backup_report.get("state"),
+        )
+        _write_status(
+            supervisor_state="healthy",
+            supervisor_phase="waiting",
+            supervisor_checked_at=_now().isoformat(timespec="seconds"),
+            supervisor_heartbeat_at=_now().isoformat(timespec="seconds"),
+            owner_token=owner_token,
+            retry_count=len(retry_results),
+            recovered_count=len(recovered),
+            next_run_at=_next_due_monitor_time(fallback_policy).isoformat(timespec="minutes"),
+            supervisor_error=None,
+        )
+    except Exception as exc:
+        log_message(f"排程監督器錯誤：{exc}")
+        _write_status(
+            supervisor_state="error",
+            supervisor_phase="failed",
+            supervisor_heartbeat_at=_now().isoformat(timespec="seconds"),
+            supervisor_error=str(exc)[:240],
+            owner_token=owner_token,
+        )
+        _send_scheduler_incident(
+            "排程監督器執行失敗",
+            f"原因：{type(exc).__name__}: {str(exc)[:240]}",
+            f"supervisor:{_now().strftime('%Y-%m-%dT%H')}",
+        )
+    finally:
+        dispatch_lock.release()
+
+
+def _run_owned_service(service_lock: ProcessLock) -> int:
     db.init_db()
     scheduler = BlockingScheduler(
         timezone=TAIPEI_TZ,
@@ -465,6 +864,7 @@ def main():
             _write_status(
                 state="waiting",
                 pid=os.getpid(),
+                owner_token=service_lock.owner.token,
                 service_started_at=_now().isoformat(timespec="seconds"),
                 timezone="Asia/Taipei",
                 schedule=f"每日 {hours_str}:00",
@@ -485,35 +885,23 @@ def main():
         _write_status(
             state="waiting",
             pid=os.getpid(),
+            owner_token=service_lock.owner.token,
             service_started_at=_now().isoformat(timespec="seconds"),
             timezone="Asia/Taipei",
             schedule=f"每 {minutes} 分鐘",
         )
 
-    # A small supervisor tick catches sleep/reboot misses, runs durable
-    # notification retries, and updates the heartbeat independently of fare jobs.
-    def supervisor_tick():
-        try:
-            retry_results = process_notification_outbox(limit=20)
-            recovered = recover_missed_runs(fallback_policy)
-            _write_status(
-                supervisor_state="healthy",
-                supervisor_checked_at=_now().isoformat(timespec="seconds"),
-                retry_count=len(retry_results),
-                recovered_count=len(recovered),
-                next_run_at=_next_due_monitor_time(fallback_policy).isoformat(timespec="minutes"),
-            )
-        except Exception as exc:
-            log_message(f"排程監督器錯誤：{exc}")
-            _write_status(supervisor_state="error", supervisor_error=str(exc)[:240])
-
     scheduler.add_job(
-        supervisor_tick,
+        _supervisor_tick,
         "interval",
         minutes=SCHEDULER_TICK_MINUTES,
         id="scheduler_supervisor",
         replace_existing=True,
         next_run_time=_now() + timedelta(seconds=10),
+        kwargs={
+            "fallback_policy": fallback_policy,
+            "owner_token": service_lock.owner.token,
+        },
     )
 
     log_message("=" * 50)
@@ -522,7 +910,40 @@ def main():
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         log_message("排程服務已停止。")
+    return 0
+
+
+def main() -> int:
+    # The lifetime lock is acquired before database migration or heartbeat
+    # writes. Its PID + process-start fingerprint + nonce allow safe stale
+    # ownership recovery without relying on file modification time.
+    waiting_logged = False
+    while True:
+        # Maintenance always owns the outer lock order. Never hold the
+        # scheduler lifetime lock while waiting for backup/restore, otherwise a
+        # restore that checks worker locks can deadlock with scheduler startup.
+        while maintenance_active(DATA_DIR):
+            if not waiting_logged:
+                print("SkyWatch scheduler is waiting for maintenance to finish.", flush=True)
+                waiting_logged = True
+            time.sleep(1.0)
+
+        service_lock = ProcessLock(DATA_DIR / "scheduler.lock", "scheduler")
+        if not service_lock.acquire():
+            print("SkyWatch scheduler is already running; duplicate process exited.", flush=True)
+            return 2
+
+        # Close the check/acquire race: if maintenance appeared between those
+        # operations, yield ownership and retry in canonical lock order.
+        if maintenance_active(DATA_DIR):
+            service_lock.release()
+            time.sleep(0.25)
+            continue
+        try:
+            return _run_owned_service(service_lock)
+        finally:
+            service_lock.release()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

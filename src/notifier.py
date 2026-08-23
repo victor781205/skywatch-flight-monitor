@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import requests
 
+from . import database as db
 from .config import (
     DISCORD_WEBHOOK_URL,
     MESSAGE_DEDUPE_HOURS,
@@ -14,10 +16,20 @@ from .config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
 )
-from . import database as db
-
 
 DUPLICATE_SUPPRESSED = "duplicate_suppressed"
+DELIVERY_UNKNOWN = "delivery_unknown"
+
+
+def _delivery_parts(value: Any) -> tuple[bool, str, dict[str, Any]]:
+    """Normalise legacy tuple senders and structured provider receipts."""
+    try:
+        ok, raw_detail = value
+    except (TypeError, ValueError) as exc:
+        raise TypeError("notification sender must return (success, detail)") from exc
+    metadata: dict[str, Any] = dict(raw_detail) if isinstance(raw_detail, Mapping) else {}
+    detail = str(metadata.get("detail") or raw_detail)
+    return bool(ok), detail[:500], metadata
 
 
 def _claim_delivery(channel: str, monitor_id: Optional[int], message: str) -> Optional[str]:
@@ -42,12 +54,12 @@ def _deliver_once(
     if claim_key == "":
         return channel, False, DUPLICATE_SUPPRESSED
 
-    ok, detail = sender(message)
+    ok, detail, _metadata = _delivery_parts(sender(message))
     if ok:
         db.log_notification(monitor_id, message, channel, True)
     else:
         db.log_notification(monitor_id, message, channel, False)
-        if claim_key:
+        if claim_key and detail != DELIVERY_UNKNOWN:
             db.release_notification_claim(claim_key)
     return channel, ok, detail
 
@@ -89,7 +101,7 @@ def send_discord(message: str) -> Tuple[bool, str]:
         return False, "Discord 連線失敗"
 
 
-def send_telegram(message: str) -> Tuple[bool, str]:
+def send_telegram(message: str) -> Tuple[bool, Any]:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         resp = requests.post(
@@ -97,14 +109,43 @@ def send_telegram(message: str) -> Tuple[bool, str]:
             json={"chat_id": TELEGRAM_CHAT_ID, "text": message[:4000]},
             timeout=20,
         )
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
         if data.get("ok"):
-            return True, "OK"
+            result = data.get("result") if isinstance(data.get("result"), Mapping) else {}
+            chat = result.get("chat") if isinstance(result.get("chat"), Mapping) else {}
+            receipt = {
+                "message_id": result.get("message_id"),
+                "date": result.get("date"),
+                "chat_id": chat.get("id"),
+            }
+            return True, {
+                "detail": "OK",
+                "message_id": result.get("message_id"),
+                "receipt": receipt,
+            }
+        if resp.status_code == 429:
+            parameters = data.get("parameters") if isinstance(data, Mapping) else None
+            retry_after = parameters.get("retry_after") if isinstance(parameters, Mapping) else None
+            if retry_after is None:
+                retry_after = resp.headers.get("Retry-After")
+            try:
+                retry_after = max(0.0, float(retry_after))
+            except (TypeError, ValueError):
+                retry_after = None
+            return False, {
+                "detail": "Telegram rate limited",
+                "retry_after": retry_after,
+            }
         description = str(data.get("description") or "Telegram 拒絕請求")
         return False, description[:160]
     except requests.Timeout:
-        return False, "連線逾時"
-    except (requests.RequestException, ValueError):
+        # A timeout after upload may still have produced a Telegram message.
+        # Automatic retry would risk a duplicate quote.
+        return False, {"detail": DELIVERY_UNKNOWN, "delivery_unknown": True}
+    except requests.RequestException:
         return False, "Telegram 連線失敗"
 
 
@@ -128,6 +169,7 @@ def enqueue_all(
     dedupe_scope: Optional[str] = None,
     next_attempt_at: Optional[datetime] = None,
     replace_pending: bool = False,
+    run_lease_token: Optional[str] = None,
 ) -> List[dict]:
     """Persist deliveries before sending so a crash cannot silently lose them."""
     channels: List[str] = []
@@ -166,6 +208,7 @@ def enqueue_all(
                 max_attempts=OUTBOX_MAX_ATTEMPTS,
                 next_attempt_at=next_attempt_at,
                 replace_pending=replace_pending,
+                run_lease_token=run_lease_token,
             )
         )
     return queued
@@ -176,21 +219,37 @@ def process_notification_outbox(limit: int = 20) -> List[dict]:
     results: List[dict] = []
     senders = {"telegram": send_telegram, "discord": send_discord}
     for item in db.claim_due_notifications(limit=limit):
+        if not db.outbox_delivery_is_owned(
+            int(item["id"]), str(item.get("lease_token") or "")
+        ):
+            # Pause/delete or another recovery owner revoked this lease after
+            # it was selected. The transaction that revoked it already set the
+            # durable terminal state; sending now would leak an obsolete fare.
+            continue
         channel = str(item["channel"]).lower()
         sender = senders.get(channel)
         if sender is None:
-            ok, detail = False, f"不支援的通知管道：{channel}"
+            ok, detail, metadata = False, f"不支援的通知管道：{channel}", {}
         else:
             try:
-                ok, detail = sender(str(item["message"]))
+                ok, detail, metadata = _delivery_parts(sender(str(item["message"])))
             except Exception as exc:
                 # Always return the lease to a terminal/retryable state even
                 # when an unexpected custom sender exception escapes.
-                ok, detail = False, f"sender_error:{type(exc).__name__}"
+                ok, detail, metadata = False, f"sender_error:{type(exc).__name__}", {}
         updated = db.complete_outbox_delivery(
             int(item["id"]),
             success=ok,
             error="" if ok else detail,
+            lease_token=str(item.get("lease_token") or ""),
+            delivery_unknown=bool(metadata.get("delivery_unknown")),
+            retry_after_seconds=metadata.get("retry_after"),
+            provider_message_id=metadata.get("message_id"),
+            provider_receipt=(
+                dict(metadata["receipt"])
+                if isinstance(metadata.get("receipt"), Mapping)
+                else None
+            ),
         )
         db.log_notification(item.get("monitor_id"), str(item["message"]), channel, ok)
         results.append(
@@ -216,6 +275,7 @@ def send_all_reliable(
     dedupe_scope: Optional[str] = None,
     next_attempt_at: Optional[datetime] = None,
     replace_pending: bool = False,
+    run_lease_token: Optional[str] = None,
 ) -> List[Tuple[str, bool, str]]:
     """Queue then immediately try delivery; queued retries remain durable."""
     queued = enqueue_all(
@@ -226,6 +286,7 @@ def send_all_reliable(
         dedupe_scope=dedupe_scope,
         next_attempt_at=next_attempt_at,
         replace_pending=replace_pending,
+        run_lease_token=run_lease_token,
     )
     if queued and queued[0].get("channel") == "local":
         return [("local", True, str(queued[0]["detail"]))]
