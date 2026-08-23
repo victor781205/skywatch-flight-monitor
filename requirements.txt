@@ -3,4 +3,4 @@ pandas>=2.0.0,<3
 python-dotenv>=1.0.0,<2
 apscheduler>=3.10.0,<4
 requests>=2.31.0,<3
-plotly>=5.18.0,<7
+plotly>=6.9.0,<7
