@@ -85,6 +85,45 @@ class SchedulerSafetyTests(unittest.TestCase):
             self.assertTrue(all(path.parent == status_file.parent for path in observed))
             self.assertEqual(list(status_file.parent.glob("*.tmp")), [])
 
+    def test_latest_run_status_uses_durable_batch_instead_of_stale_heartbeat(self):
+        runs = [
+            {
+                "status": "succeeded",
+                "scheduled_slot": "2026-08-23T12:00+08:00",
+                "started_at": "2026-08-23T12:00:01",
+                "completed_at": "2026-08-23T12:00:05",
+                "backfill": 0,
+                "result_json": json.dumps({"notified": True, "hit": True}),
+            },
+            {
+                "status": "failed",
+                "scheduled_slot": "2026-08-23T12:00+08:00",
+                "started_at": "2026-08-23T12:00:00",
+                "completed_at": "2026-08-23T12:00:07",
+                "backfill": 0,
+                "result_json": "{}",
+            },
+            {
+                "status": "succeeded",
+                "scheduled_slot": "2026-08-23T00:00+08:00",
+                "started_at": "2026-08-23T00:00:00",
+                "completed_at": "2026-08-23T00:00:04",
+                "backfill": 0,
+                "result_json": "{}",
+            },
+        ]
+        with patch.object(scheduler_service.db, "list_check_runs", return_value=runs):
+            status = scheduler_service._latest_run_status()
+
+        self.assertEqual(status["last_slot"], "2026-08-23T12:00+08:00")
+        self.assertEqual(status["last_started_at"], "2026-08-23T12:00:00+08:00")
+        self.assertEqual(status["last_completed_at"], "2026-08-23T12:00:07+08:00")
+        self.assertEqual(status["last_result_count"], 2)
+        self.assertEqual(status["last_notification_count"], 1)
+        self.assertEqual(status["last_hit_count"], 1)
+        self.assertEqual(status["last_run_duration"], 7.0)
+        self.assertEqual(status["last_success_rate"], 0.5)
+
     def test_duplicate_main_does_not_touch_database_or_heartbeat(self):
         fake_lock = self._fake_lock(acquired=False)
         with (
@@ -272,8 +311,6 @@ class SchedulerSafetyTests(unittest.TestCase):
                 SchedulePolicy.from_dict({}), now=now
             )
         self.assertEqual(results[0]["monitor_id"], 7)
-        self.assertEqual(results[0]["scheduled_slot"], "2026-08-12T12:00+08:00")
-        self.assertTrue(results[0]["backfill"])
         self.assertTrue(check.call_args.kwargs["backfill"])
         self.assertEqual(check.call_args.kwargs["monitor_ids"], [7])
         self.assertEqual(incident.call_count, 2)
@@ -382,16 +419,7 @@ class SchedulerSafetyTests(unittest.TestCase):
         def recover(_policy, *, heartbeat):
             heartbeat("monitor_batch", monitor_id=7, batch_index=1, batch_total=1)
             heartbeat("monitor_attempt", monitor_id=7, attempt=1, total_attempts=2)
-            return [
-                {
-                    "monitor_id": 7,
-                    "ok": True,
-                    "notified": True,
-                    "hit": False,
-                    "scheduled_slot": "2026-08-23T12:00+08:00",
-                    "backfill": False,
-                }
-            ]
+            return [{"monitor_id": 7, "ok": True}]
 
         with (
             patch.object(scheduler_service, "maintenance_active", return_value=False),
@@ -407,6 +435,18 @@ class SchedulerSafetyTests(unittest.TestCase):
                 scheduler_service,
                 "_next_due_monitor_time",
                 return_value=datetime(2026, 8, 24, tzinfo=ZoneInfo("Asia/Taipei")),
+            ),
+            patch.object(
+                scheduler_service,
+                "_latest_run_status",
+                return_value={
+                    "last_completed_at": "2026-08-23T12:00:07+08:00",
+                    "last_slot": "2026-08-23T12:00+08:00",
+                    "last_result_count": 1,
+                    "last_notification_count": 1,
+                    "last_success_rate": 1.0,
+                    "last_backfill": False,
+                },
             ),
             patch.object(scheduler_service, "_write_status") as write_status,
         ):
@@ -578,6 +618,7 @@ class SchedulerSafetyTests(unittest.TestCase):
                 "_next_due_monitor_time",
                 return_value=datetime(2026, 8, 24, tzinfo=ZoneInfo("Asia/Taipei")),
             ),
+            patch.object(scheduler_service, "_latest_run_status", return_value={}),
             patch.object(scheduler_service, "_write_status") as write_status,
             patch.object(scheduler_service, "_send_scheduler_incident") as incident,
         ):

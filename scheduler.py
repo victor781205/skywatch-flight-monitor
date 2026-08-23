@@ -149,6 +149,81 @@ def _schedule_moment(value: object) -> Optional[datetime]:
     return parsed.astimezone(TAIPEI_TZ)
 
 
+def _latest_run_status() -> dict[str, object]:
+    """Build user-facing batch metrics from the durable run ledger."""
+
+    terminal = {
+        "succeeded",
+        "partial",
+        "failed",
+        "skipped",
+        "missed",
+        "backfilled",
+        "cancelled",
+    }
+    runs = [
+        run
+        for run in db.list_check_runs(limit=200)
+        if str(run.get("status") or "") in terminal and run.get("completed_at")
+    ]
+    if not runs:
+        return {}
+
+    latest = runs[0]
+    slot = str(latest.get("scheduled_slot") or "")
+    batch = (
+        [run for run in runs if str(run.get("scheduled_slot") or "") == slot]
+        if slot
+        else [latest]
+    )
+    starts = [
+        moment
+        for moment in (_schedule_moment(run.get("started_at")) for run in batch)
+        if moment is not None
+    ]
+    completions = [
+        moment
+        for moment in (_schedule_moment(run.get("completed_at")) for run in batch)
+        if moment is not None
+    ]
+    if not completions:
+        return {}
+
+    results: list[dict] = []
+    for run in batch:
+        raw_result = run.get("result_json")
+        if isinstance(raw_result, dict):
+            results.append(raw_result)
+            continue
+        try:
+            parsed = json.loads(str(raw_result or "{}"))
+        except (TypeError, ValueError):
+            parsed = {}
+        results.append(parsed if isinstance(parsed, dict) else {})
+
+    completed_at = max(completions)
+    started_at = min(starts) if starts else completed_at
+    successful = sum(
+        1 for run in batch if str(run.get("status") or "") in {"succeeded", "backfilled"}
+    )
+    status: dict[str, object] = {
+        "state": "healthy",
+        "last_started_at": started_at.isoformat(timespec="seconds"),
+        "last_completed_at": completed_at.isoformat(timespec="seconds"),
+        "last_result_count": len(batch),
+        "last_notification_count": sum(1 for result in results if result.get("notified")),
+        "last_backfill": any(bool(run.get("backfill")) for run in batch),
+        "last_hit_count": sum(1 for result in results if result.get("hit")),
+        "last_run_duration": max(0.0, (completed_at - started_at).total_seconds()),
+        "last_success_rate": successful / len(batch),
+        "last_checked_count": len(batch),
+        "last_error": None,
+    }
+    if slot:
+        status["last_slot"] = slot
+    return status
+
+
 def _global_schedule(hours_env: str, interval_env: str) -> SchedulePolicy:
     if interval_env:
         return SchedulePolicy.from_dict(
@@ -659,18 +734,7 @@ def recover_missed_runs(
             heartbeat=heartbeat,
             announce_recovery=not is_backfill,
         )
-        # Preserve dispatch context for the supervisor's aggregate heartbeat.
-        # The monitor result itself intentionally contains fare data only, so
-        # without this annotation /status can keep showing an older direct-job
-        # completion even though the durable supervisor just finished a slot.
-        recovered.extend(
-            {
-                **result,
-                "scheduled_slot": key,
-                "backfill": is_backfill,
-            }
-            for result in results
-        )
+        recovered.extend(results)
         _persist_next_monitor_run(monitor, fallback, after=current)
         ok = bool(results and results[0].get("ok"))
         if is_backfill:
@@ -792,12 +856,10 @@ def _supervisor_tick(fallback_policy: SchedulePolicy, *, owner_token: str) -> No
     try:
         retry_results = process_notification_outbox(limit=20)
         heartbeat("notifications_processed", retry_count=len(retry_results))
-        fare_started_at = _now()
         recovered = recover_missed_runs(
             fallback_policy,
             heartbeat=heartbeat,
         )
-        fare_completed_at = _now()
         heartbeat("fare_batch_complete", recovered_count=len(recovered))
         try:
             backup_report = _maybe_create_auto_backup()
@@ -849,39 +911,7 @@ def _supervisor_tick(fallback_policy: SchedulePolicy, *, owner_token: str) -> No
             ),
             "supervisor_error": None,
         }
-        if recovered:
-            successful = sum(1 for result in recovered if result.get("ok"))
-            slots = [
-                str(result["scheduled_slot"])
-                for result in recovered
-                if result.get("scheduled_slot")
-            ]
-            final_status.update(
-                {
-                    "state": "healthy",
-                    "last_started_at": fare_started_at.isoformat(timespec="seconds"),
-                    "last_completed_at": fare_completed_at.isoformat(timespec="seconds"),
-                    "last_result_count": len(recovered),
-                    "last_notification_count": sum(
-                        1 for result in recovered if result.get("notified")
-                    ),
-                    "last_backfill": any(
-                        bool(result.get("backfill")) for result in recovered
-                    ),
-                    "last_hit_count": sum(
-                        1 for result in recovered if result.get("hit")
-                    ),
-                    "last_run_duration": max(
-                        0.0,
-                        (fare_completed_at - fare_started_at).total_seconds(),
-                    ),
-                    "last_success_rate": successful / len(recovered),
-                    "last_checked_count": len(recovered),
-                    "last_error": None,
-                }
-            )
-            if slots:
-                final_status["last_slot"] = max(slots)
+        final_status.update(_latest_run_status())
         _write_status(
             **final_status,
         )
