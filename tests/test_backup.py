@@ -183,10 +183,14 @@ class BackupTests(unittest.TestCase):
         self._set_target_price(33333)
         real_validate = backup._validate_sqlite
         failed_live_validation = False
+        resolved_live_database = self.database.resolve()
 
         def fail_first_live_validation(path):
             nonlocal failed_live_validation
-            if Path(path) == self.database and not failed_live_validation:
+            # Windows hosted runners can expose the temp directory through a
+            # short-name or junction spelling. Compare canonical paths just as
+            # restore_full_backup does before invoking the validator.
+            if Path(path).resolve() == resolved_live_database and not failed_live_validation:
                 failed_live_validation = True
                 raise backup.BackupValidationError("simulated post-replace failure")
             return real_validate(path)
