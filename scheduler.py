@@ -659,7 +659,18 @@ def recover_missed_runs(
             heartbeat=heartbeat,
             announce_recovery=not is_backfill,
         )
-        recovered.extend(results)
+        # Preserve dispatch context for the supervisor's aggregate heartbeat.
+        # The monitor result itself intentionally contains fare data only, so
+        # without this annotation /status can keep showing an older direct-job
+        # completion even though the durable supervisor just finished a slot.
+        recovered.extend(
+            {
+                **result,
+                "scheduled_slot": key,
+                "backfill": is_backfill,
+            }
+            for result in results
+        )
         _persist_next_monitor_run(monitor, fallback, after=current)
         ok = bool(results and results[0].get("ok"))
         if is_backfill:
@@ -781,10 +792,12 @@ def _supervisor_tick(fallback_policy: SchedulePolicy, *, owner_token: str) -> No
     try:
         retry_results = process_notification_outbox(limit=20)
         heartbeat("notifications_processed", retry_count=len(retry_results))
+        fare_started_at = _now()
         recovered = recover_missed_runs(
             fallback_policy,
             heartbeat=heartbeat,
         )
+        fare_completed_at = _now()
         heartbeat("fare_batch_complete", recovered_count=len(recovered))
         try:
             backup_report = _maybe_create_auto_backup()
@@ -823,16 +836,54 @@ def _supervisor_tick(fallback_policy: SchedulePolicy, *, owner_token: str) -> No
             recovered_count=len(recovered),
             auto_backup_state=backup_report.get("state"),
         )
+        final_status: dict[str, object] = {
+            "supervisor_state": "healthy",
+            "supervisor_phase": "waiting",
+            "supervisor_checked_at": _now().isoformat(timespec="seconds"),
+            "supervisor_heartbeat_at": _now().isoformat(timespec="seconds"),
+            "owner_token": owner_token,
+            "retry_count": len(retry_results),
+            "recovered_count": len(recovered),
+            "next_run_at": _next_due_monitor_time(fallback_policy).isoformat(
+                timespec="minutes"
+            ),
+            "supervisor_error": None,
+        }
+        if recovered:
+            successful = sum(1 for result in recovered if result.get("ok"))
+            slots = [
+                str(result["scheduled_slot"])
+                for result in recovered
+                if result.get("scheduled_slot")
+            ]
+            final_status.update(
+                {
+                    "state": "healthy",
+                    "last_started_at": fare_started_at.isoformat(timespec="seconds"),
+                    "last_completed_at": fare_completed_at.isoformat(timespec="seconds"),
+                    "last_result_count": len(recovered),
+                    "last_notification_count": sum(
+                        1 for result in recovered if result.get("notified")
+                    ),
+                    "last_backfill": any(
+                        bool(result.get("backfill")) for result in recovered
+                    ),
+                    "last_hit_count": sum(
+                        1 for result in recovered if result.get("hit")
+                    ),
+                    "last_run_duration": max(
+                        0.0,
+                        (fare_completed_at - fare_started_at).total_seconds(),
+                    ),
+                    "last_success_rate": successful / len(recovered),
+                    "last_checked_count": len(recovered),
+                    "last_error": None,
+                }
+            )
+            if slots:
+                final_status["last_slot"] = max(slots)
         _write_status(
-            supervisor_state="healthy",
-            supervisor_phase="waiting",
-            supervisor_checked_at=_now().isoformat(timespec="seconds"),
-            supervisor_heartbeat_at=_now().isoformat(timespec="seconds"),
-            owner_token=owner_token,
-            retry_count=len(retry_results),
-            recovered_count=len(recovered),
-            next_run_at=_next_due_monitor_time(fallback_policy).isoformat(timespec="minutes"),
-            supervisor_error=None,
+            **final_status,
         )
     except Exception as exc:
         log_message(f"排程監督器錯誤：{exc}")

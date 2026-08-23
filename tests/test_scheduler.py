@@ -272,6 +272,8 @@ class SchedulerSafetyTests(unittest.TestCase):
                 SchedulePolicy.from_dict({}), now=now
             )
         self.assertEqual(results[0]["monitor_id"], 7)
+        self.assertEqual(results[0]["scheduled_slot"], "2026-08-12T12:00+08:00")
+        self.assertTrue(results[0]["backfill"])
         self.assertTrue(check.call_args.kwargs["backfill"])
         self.assertEqual(check.call_args.kwargs["monitor_ids"], [7])
         self.assertEqual(incident.call_count, 2)
@@ -380,7 +382,16 @@ class SchedulerSafetyTests(unittest.TestCase):
         def recover(_policy, *, heartbeat):
             heartbeat("monitor_batch", monitor_id=7, batch_index=1, batch_total=1)
             heartbeat("monitor_attempt", monitor_id=7, attempt=1, total_attempts=2)
-            return [{"monitor_id": 7, "ok": True}]
+            return [
+                {
+                    "monitor_id": 7,
+                    "ok": True,
+                    "notified": True,
+                    "hit": False,
+                    "scheduled_slot": "2026-08-23T12:00+08:00",
+                    "backfill": False,
+                }
+            ]
 
         with (
             patch.object(scheduler_service, "maintenance_active", return_value=False),
@@ -418,6 +429,16 @@ class SchedulerSafetyTests(unittest.TestCase):
                 for call in write_status.call_args_list
             )
         )
+        completed = next(
+            call
+            for call in write_status.call_args_list
+            if call.kwargs.get("last_completed_at")
+        )
+        self.assertEqual(completed.kwargs["last_slot"], "2026-08-23T12:00+08:00")
+        self.assertEqual(completed.kwargs["last_result_count"], 1)
+        self.assertEqual(completed.kwargs["last_notification_count"], 1)
+        self.assertEqual(completed.kwargs["last_success_rate"], 1.0)
+        self.assertFalse(completed.kwargs["last_backfill"])
 
     def test_supervisor_maintenance_or_lock_contention_never_reports_recovery(self):
         policy = SchedulePolicy.from_dict({})

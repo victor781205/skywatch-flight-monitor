@@ -6,6 +6,12 @@ SkyWatch 的重要變更記錄於此。版本編號遵循 [Semantic Versioning](
 
 - 尚無。
 
+## [3.1.2] - 2026-08-23
+
+### Fixed
+
+- 監督器派送完成後同步更新 heartbeat 的最近完成時間、排程槽、通知數、成功率、命中數與耗時，讓 dashboard 與 Telegram `/status` 不再顯示上一個舊批次。
+
 ## [3.1.1] - 2026-08-23
 
 ### Fixed
